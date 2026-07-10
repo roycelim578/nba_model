@@ -35,8 +35,11 @@ snapshot date it computes box-score stats, advanced impact metrics, trajectory
 (season-to-date, rolling and exponentially-weighted windows), team context (record, net
 rating, seeding), career context (prior award shares, age, experience), and eligibility
 (games played, projected games, the 65-game-rule flag, injury state). `feature_loader`
-assembles these, and `eligibility` (under `features/eligibility`) computes the
-availability factors used both as features and later as a reweight.
+assembles these; `nba_candidate_filter` decides who is admitted to a race at each
+snapshot (the candidate set the model prices over); `positional_z` adds within-position
+standardised versions of the defensive and box stats; and `eligibility` (under
+`features/eligibility`) computes the availability factors used both as features and
+later as a reweight.
 
 Two things are load-bearing here. First, relative encodings: for each per-candidate
 stat, `relative_feature_cols` also produces its rank, percentile, delta-to-leader and
@@ -83,18 +86,30 @@ snapshot. It is wrapped by a content-addressed samples cache (`samples_cache`) k
 the artefact paths and mtimes and a fingerprint of the scoring code, so an edit that
 does not touch scoring reuses the cached scores.
 
-The reduction produces four distinct objects, and keeping them distinct is a deliberate
-decision (see DECISIONS):
+The reduction produces two live weightings from the same score cloud, plus the ensemble
+dispersion, and keeping the two weightings distinct is a deliberate decision (see
+DECISIONS). Both are computed in `soft_outcome` (in `scripts/strategy/sizing`):
 
-- The ensemble mean score per candidate, softmaxed within the race, is
-  `vote_share_pred`, the calibrated central estimate (softmax_of_mean). This is the fair
-  value and the edge object.
-- A forward-noise term `eta` (Student-t, with a dispersion that scales with season
-  fraction, fit on OOF residuals up to `OOF_SEASON_CAP`) is added to the per-booster
-  scores to build a simulated future-score cloud; the argmax over that cloud gives
-  `p_win` (Monte Carlo win probability), and the mean of its softmax gives
-  `sizing_weights` (mean_of_softmax). The ensemble dispersion is thus carried into the
-  risk layer, not folded into the point estimate.
+- `edge_weights`, the softmax of the ensemble mean score within a race
+  (softmax_of_mean). This is `vote_share_pred`, the calibrated central estimate, the
+  fair value, and the object differenced against price to quote edge. A forward-noise
+  term `eta` (Student-t, dispersion scaling with season fraction, fit on OOF residuals
+  up to `OOF_SEASON_CAP`) is added to the per-booster scores to build a simulated
+  future-score cloud, but because `eta` is mean-zero it washes out of this mean, so the
+  point estimate is unaffected by forward noise.
+- `sizing_weights`, the mean over the `eta`-perturbed cloud of the per-draw softmax
+  (mean_of_softmax). This is the frequency with which each candidate actually wins
+  across the cloud, and it is the outcome probability a hold-to-resolution log-Kelly
+  objective must weight by (wealth depends only on who wins, so the log-Kelly
+  expectation collapses analytically to a sum over candidates of that frequency times
+  the log wealth in their winning state). Here `eta` does not cancel, since the softmax
+  is non-linear, so forward uncertainty flattens these weights, the intended and
+  conservative channel by which dispersion reaches sizing.
+
+The old hard argmax-per-draw win count (a nominal `p_win`) is retired: it turned a small
+score margin into a full winner flip, the discretisation artefact behind an early
+flattening the design disowns. The analytic mean_of_softmax is its zero-variance
+equivalent.
 
 ## 6. Reweight pipeline (per day, in `_award_core`)
 
@@ -108,19 +123,24 @@ with its own gate:
    gate.
 2. Eligibility reweight (`_elig_factors`, `_elig_reweight`). The availability factors
    (injury, games played, the 65-game rule) multiply the vote-share prediction, so an
-   ineligible or heavily-missed candidate is downweighted. The same factors are applied
-   as a log-shift to the simulation cloud so the sizing distribution sees them too.
+   ineligible or heavily-missed candidate is downweighted; they are backed by
+   `injury_miss_model` (a distribution over how many further games an injured player
+   will miss) and `injury_categories` (classifying free-text injury-report reasons). The
+   same factors are applied as a log-shift to the simulation cloud so the sizing
+   distribution sees them too.
 3. Rank floor (`rank_floor_mask`). The tradeable set is the top candidates by base
    P(win): 20 for DPOY, 15 for MVP, 10 for ROTY. This is a set definition, not a
    fair-value correction; the full field's mass is kept (it sums to one) and out-of-set
    candidates are simply pinned to zero position.
-4. Renormalisation and first-place floor (`renorm_set`, `fp_point_loader`, gated by
-   `RENORM_MODE` and `JSFLOOR_AWARDS`). The contender set's mass is reconciled against
-   market tradeability and, for the floored awards, lifted toward a first-place-share
-   floor from a separate feed. A key fix here (see DECISIONS): the softmax denominator
-   is the contender set ignoring tradeability, while the allocation mask is the
-   contender set intersected with tradeability, so an untradeable favourite parks its
-   mass as cash rather than dumping it onto the largest tradeable survivor.
+4. Renormalisation and first-place floor (`renorm_set`, `jspeak_reshape`,
+   `fp_point_loader`, gated by `RENORM_MODE` and `JSFLOOR_AWARDS`). The contender set's
+   mass is reconciled against market tradeability and, for the floored awards, lifted
+   toward a first-place-share floor from a separate feed (`fp_point_loader` supplies the
+   points, `jspeak_reshape` performs the lift into `renorm_set`'s masked-cloud reshape).
+   A key fix here (see DECISIONS): the softmax denominator is the contender set ignoring
+   tradeability, while the allocation mask is the contender set intersected with
+   tradeability, so an untradeable favourite parks its mass as cash rather than dumping
+   it onto the largest tradeable survivor.
 
 ## 7. Forward estimates: edge and price variance
 
@@ -138,18 +158,22 @@ here and in the sizing scaler; it is calibrated from Polymarket price-history da
 signed dollar variable per candidate (positive is a YES, negative a NO), maximising
 expected log-growth over the joint winner states weighted by the central estimate, with
 size-dependent leg costs, solved by SLSQP with restarts (restart spread flags
-non-convexity). Three mechanisms sit inside it: winner-state weights are the calibrated
-`vote_share_pred` (not the flatter mean_of_softmax); a turnover toll in the objective
-plus a warm start from the current position stabilise the target week to week; and a
-fade-your-own-top-k guard forbids a NO leg on the model's own favourites. Kelly fraction
-is pinned at 1.0; conservatism is delegated downstream.
+non-convexity). Three mechanisms sit inside it: winner-state weights are the
+mean_of_softmax `sizing_weights` (the frequency each candidate actually wins across the
+cloud), which is the probability a hold-to-resolution log-Kelly objective must use,
+while the edge compared against price is quoted separately on the sharper softmax_of_mean
+estimate; a turnover toll in the objective plus a warm start from the current position
+stabilise the target week to week; and a fade-your-own-top-k guard forbids a NO leg on
+the model's own favourites. Kelly fraction is pinned at 1.0; conservatism is delegated
+downstream.
 
 The raw signed Kelly allocation then passes through `size_scaling.scale_allocation`,
 which applies two smooth multiplicative shrinks: `f_vol` (rolls size off when forward
 price dispersion is high; defaults to 1 when the caller has already applied the vol fill
-fraction) and `f_conc` (a per-name concentration roll-off, load-bearing, it holds the
-book near one-third Kelly and its removal reproduces the rejected full-Kelly drawdown
-pathology). The former tail-distrust scaler `f_tail` has been removed as inert.
+fraction, which `sizer_fill` does upstream) and `f_conc` (a per-name concentration
+roll-off, load-bearing, it holds the book near one-third Kelly and its removal reproduces
+the rejected full-Kelly drawdown pathology). The former tail-distrust scaler `f_tail` has
+been removed as inert.
 
 ## 9. Execution: the no-trade region
 

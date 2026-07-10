@@ -34,7 +34,7 @@ sizer's fill fraction (so outcome variance is not double-counted in the size).
 
 import numpy as np
 
-from scripts.backtest.settle.soft_outcome import _softmax
+from scripts.strategy.sizing.soft_outcome import _softmax
 
 
 def per_draw_pwin(cloud, cand_idx):

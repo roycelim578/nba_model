@@ -50,7 +50,8 @@ These populate `data/awards.db` and run periodically, never during a backtest.
   a given race at a given snapshot.
 - `eligibility/eligibility.py` (240L, hot). As-of eligibility reweight (v2), the
   injury-conditioned availability mixture, used both as a feature and as a reweight.
-- `positional_z.py` (191L, hot). Positional z-scores (no docstring; audit below).
+- `positional_z.py` (191L, hot). Within-position standardised box and advanced stats,
+  feeding the relative-feature encodings (audit #5, docstring added).
 
 ## scripts/modelling — training and scoring (all auxiliary)
 
@@ -58,16 +59,18 @@ These produce the artefacts the backtest loads; they do not run during a backtes
 
 - `train/pl_objective.py` (208L). The custom LightGBM grouped Plackett-Luce
   multinomial cross-entropy objective.
-- `train/pl_trainer.py` (746L). The PL trainer scaffold (labelled Phase 2 close / Phase
-  3 model; audit below).
+- `train/pl_trainer.py` (746L). The shared PL training core: objective wiring, K-booster
+  ensemble fit and feature handling, imported by `persist_fold`, `retrain`, `score_fold`
+  and `oof_stage1`. Load-bearing, not scaffold (audit #3 resolved).
 - `train/persist_fold.py` (243L). Trains and persists a single walk-forward fold's
   K-booster ensemble; carries the held-out training guard.
 - `train/retrain.py` (322L). The monotone-constraint A/B retrain for MVP and DPOY plus
   the jspeak-floor component for ROTY: this is what produced the deployed finals.
 - `score/score_fold.py` (218L). Scores a target season with a persisted ensemble, writes
   `model_predictions`; a validation and fold-scoring tool.
-- `score/oof_stage1.py` (257L). The out-of-fold scorer that produced the OOF bundles;
-  named for the two-stage residual narrative model (audit below).
+- `score/oof_stage1.py` (257L). Produces the walk-forward OOF score bundles (the
+  `OOF_BUNDLE` artefacts) for eta calibration and book-weighting. Has no importers; the
+  two-stage narrative model it was named for is dead (audit #4, docstring corrected).
 
 ## scripts/strategy — the trading logic
 
@@ -102,6 +105,9 @@ These produce the artefacts the backtest loads; they do not run during a backtes
   (`f_tail` removed).
 - `sizing/sizer_fill.py` (72L, hot). Fill-fraction glue wiring the vol fill into the
   sizer.
+- `sizing/soft_outcome.py` (114L, hot). The score-cloud reductions `edge_weights`
+  (softmax_of_mean, used for edge) and `sizing_weights` (mean_of_softmax, the log-Kelly
+  outcome weights). Moved here from `backtest/settle` (audit #6).
 
 ### allocation
 
@@ -129,8 +135,7 @@ These produce the artefacts the backtest loads; they do not run during a backtes
   independent daily processes and pools them; reads `config.BOOK_WEIGHTS`.
 - `engine/backtest_orchestrator.py` (370L, hot). The shared-helper library:
   `A_build_samples`, the sample cloud, `_rebalance_to`, `_close_leg`, `_dump_csv` and the
-  execution constants. Docstring still says "season orchestrator (2024 dev season)"
-  (audit below).
+  execution constants. No run path of its own (audit #1, docstring corrected).
 - `engine/backtest_orchestrator_daily.py` (460L, hot). The daily run path:
   `prepare_award_daily` (where the seal guard sits), `_award_core`, the per-day reweight
   chain and rebalance.
@@ -143,34 +148,28 @@ These produce the artefacts the backtest loads; they do not run during a backtes
 
 - `settle/trade_ledger.py` (312L, hot). Positions, cash, trade log, per-player PnL
   attribution, and the model-versus-strategy verdict layer.
-- `settle/soft_outcome.py` (114L, hot). Soft-outcome consistency for the portfolio-Kelly
-  sizer.
 
-## Audit flags: suspected redundancies and stale names
+## Audit flags: status after the cleanup pass
 
-These are things to verify, not confirmed dead code. Each should be checked by
-neutralising or grepping and re-running the gate before any removal (per the project's
-deletion discipline).
+All six flags from the first inventory were checked by import-grep and, where changed,
+re-gated. None turned out to be dead code. Resolutions:
 
-1. `backtest_orchestrator.py` docstring still reads "Season orchestrator for the sized
-   net-exposure backtest (2024 dev season)", but the file is now the shared-helper
-   library with no run path. The docstring should be rewritten to reflect that; confirm
-   no dead season-run function remains inside it.
-2. Daily versus non-daily duplication: `backtest_samples.py` and `backtest_pricejoin.py`
-   sit alongside `..._daily.py` variants. The sealed path is the daily one. Confirm
-   whether the non-daily pair is still referenced anywhere on a live path or is legacy
-   from the pre-daily-cadence design and can be retired.
-3. Three training entry points: `pl_trainer.py` (746L scaffold), `persist_fold.py`
-   (fold trainer with the guard), and `retrain.py` (the monotone retrain that produced
-   the deployed finals). Confirm `pl_trainer` is not superseded by the other two; if it
-   is only historical scaffold, mark or archive it.
-4. `oof_stage1.py` is named for the two-stage residual narrative model, but narrative is
-   dead. Confirm it now runs stage-one only and rename to drop the narrative reference,
-   so its role (producing the OOF bundles) is not misread.
-5. `positional_z.py` has no module docstring. Confirm it is on the feature path (likely
-   the DPOY positional encoding) and add a one-line docstring.
-6. `soft_outcome.py` lives under settle but serves the sizer. Confirm it is wired in and
-   consider whether it belongs under `strategy/sizing` rather than `backtest/settle`.
+1. `backtest_orchestrator.py` stale docstring: FIXED. Rewritten to describe the
+   shared-helper library it now is (no run path of its own).
+2. Daily versus non-daily `samples`/`pricejoin`: NOT redundant. The non-daily
+   `backtest_samples` and `backtest_pricejoin` are imported by the shared orchestrator
+   through `A_build_samples`, so both are on the hot path. `backtest_samples` has no
+   daily twin; only `pricejoin` does. One sub-check remains open: confirm
+   `backtest_pricejoin_daily` has importers before ever retiring it.
+3. Three training entry points: NOT redundant. `pl_trainer` is the shared training core
+   imported by `persist_fold`, `retrain`, `score_fold` and `oof_stage1`, not superseded
+   scaffold. Docstring clarified.
+4. `oof_stage1` narrative naming: FIXED. Docstring corrected. It has no importers and
+   produces the OOF bundles; the file was not renamed (nothing imports it, low value).
+5. `positional_z` missing docstring: FIXED. Docstring added.
+6. `soft_outcome` placement: FIXED. Moved from `backtest/settle` to `strategy/sizing`,
+   its real home; the two package-path importers (`forward_edge`, `renorm_set`) were
+   repointed and the gate stayed bit-identical.
 
-None of these affect the sealed result as it stands; they are hygiene and clarity items
-for the next pass.
+The only open item is the sub-check under #2 (`backtest_pricejoin_daily` usage). Until
+that is confirmed, nothing in the samples/pricejoin group is retired.

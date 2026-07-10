@@ -66,14 +66,22 @@ year, so 2024 means 2024-25.
   the backtest reads.
 - Per-award seal registry and guard.
 - Repository hygiene files (dependency spec, gitignore, README).
+- Documentation set: STATUS, DECISIONS, MECHANICS, RESULTS, and a file-by-file STRUCTURE
+  inventory.
+- Post-baseline audit pass: the six structure and redundancy flags checked (none dead
+  code), stale docstrings corrected, and `soft_outcome` relocated from `backtest/settle`
+  to `strategy/sizing` with the gate bit-identical.
 
 ## In flight
 
-- Documentation: STATUS and DECISIONS done; MECHANICS and RESULTS being written.
+- Nothing substantive. One minor audit sub-check remains (whether
+  `backtest_pricejoin_daily` has any importers), noted in STRUCTURE for the next time the
+  engine is touched.
 
 ## Next
 
-- git initialisation, last, so it captures the settled tree including the docs.
+- Commit the post-baseline cleanup (the docstring corrections, the `soft_outcome` move,
+  and this documentation set) on top of the initial baseline commit.
 
 ## On the horizon
 
@@ -111,6 +119,10 @@ waits on the documentation and a period of paper trading before any capital is s
 
 ## Change log
 
+- 2026-07-10 (later): initial baseline committed to git; post-baseline audit pass applied
+  (docstring corrections on `backtest_orchestrator`, `positional_z`, `oof_stage1` and
+  `pl_trainer`; `soft_outcome` moved to `strategy/sizing`, gate bit-identical); full
+  documentation set finalised.
 - 2026-07-10: repository migration and cleanup completed; book-weighting pinned; seal
   registry and guard added; hygiene files added. Sealed result held bit-identical
   throughout.

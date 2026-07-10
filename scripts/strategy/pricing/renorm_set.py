@@ -52,7 +52,7 @@ from __future__ import annotations
 import numpy as np
 
 try:
-    from scripts.backtest.settle.soft_outcome import edge_weights, sizing_weights as _sizing_weights
+    from scripts.strategy.sizing.soft_outcome import edge_weights, sizing_weights as _sizing_weights
 except ImportError:  # pragma: no cover
     from soft_outcome import edge_weights, sizing_weights as _sizing_weights
 
