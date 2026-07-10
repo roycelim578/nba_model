@@ -1,0 +1,25 @@
+# Artefact and data stores: backed up separately, NOT version-controlled.
+# models/ holds the deployed finals, OOF bundles, per-fold boosters, fp and
+# forward-vol artefacts (load-bearing, not cheaply regenerable, restore from backup).
+# data/ holds the SQLite DB and caches. out/ holds run outputs, caches and goldens.
+data/
+out/
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.uv/
+
+# Backups, scratch, OS
+*.bak
+*.bak[0-9]
+temp/
+misc/
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/

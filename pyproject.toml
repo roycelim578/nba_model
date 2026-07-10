@@ -1,0 +1,53 @@
+[project]
+name = "nba-awards-trader"
+version = "0.1.0"
+description = "Fair-value pricing and trading for NBA voter-decided awards on Polymarket"
+requires-python = ">=3.11"
+dependencies = [
+    # core scientific
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+    "statsmodels>=0.14",
+    # model
+    "lightgbm>=4.0",
+    # data sources
+    "nba-api>=1.4",
+    "requests>=2.31",
+    "curl_cffi>=0.6",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "html5lib>=1.1",
+    "rapidfuzz>=3.6",
+    # Polymarket
+    "websockets>=12.0",
+    "websocket-client>=1.7",
+    "py-clob-client>=0.17",
+    # utilities
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+    "tenacity>=8.2",
+    # plotting
+    "matplotlib>=3.8",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+pythonpath = ["."]
