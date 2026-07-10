@@ -1,32 +1,7 @@
-"""LightGBM Plackett-Luce trainer scaffold (Phase 2 close / Phase 3 model).
-
-Owns everything AROUND the custom objective: read a named feature selection,
-assemble the design matrix, build walk-forward folds grouped by season, factorise
-group_key -> integer group_ids in row order, run a grouped bootstrap ensemble,
-and score (Brier on P(win), vote-share RMSE, CI coverage, top-k) against
-benchmarks. The custom Plackett-Luce objective is INJECTED via make_pl_objective
-(parallel chat owns it; until it lands we inject a stub so the whole scaffold is
-testable end-to-end).
-
-INVARIANTS (inherited, do not break):
-  - Season = STARTING year. group_key = "award|season|snapshot".
-  - Walk-forward CV grouped by season: train <= T, predict T+1, rolling. A season
-    is NEVER split across train/test.
-  - 2024 and 2025 are held out ENTIRELY (never in any train or validation fold);
-    reserved for the final trading-strategy test.
-  - The admitted set is the softmax group; the label is zero-padded, within-group
-    normalised vote_share, never renormalised over vote-getters only.
-  - The trainer reads a NAMED selection_id; it never re-runs feature selection.
-
-OBJECTIVE SEAM (frozen, see HANDOFF_pl_objective_parallel_chat.md):
-  make_pl_objective(group_ids: np.ndarray) -> fobj(predt, dtrain) -> (grad, hess)
-  group_ids is integer-coded, row-aligned to the training matrix, grouped by
-  equality (not assumed sorted/contiguous). The trainer builds group_ids by
-  factorising the fold's group_key column in row order and passes the closure as
-  fobj to lgb.train.
-
-Run from project root (once the real objective + lightgbm are in place):
-  uv run python -m scripts.modelling.train.pl_trainer --award MVP --selection-id <id> [--k 200]
+"""Shared LightGBM Plackett-Luce training core: the trainer primitives (grouped-PL
+objective wiring, K-booster ensemble fit, feature handling) imported by persist_fold,
+retrain, score_fold and oof_stage1. The training entry points are persist_fold (per-fold
+ensembles) and retrain (the deployed monotone finals); this module holds what they share.
 """
 from __future__ import annotations
 

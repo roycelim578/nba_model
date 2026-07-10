@@ -1,27 +1,8 @@
-"""Out-of-fold stage-1 scorer for the two-stage residual narrative model.
-
-The residual model's label is observed_share - stage1_share, and the target LEAKS
-unless every training row's stage1_share is OUT-OF-FOLD (stage 1 never trained on
-that row's season). This module produces those OOF scores.
-
-KEY REALISATION: the existing walk-forward IS the OOF generator. pl_trainer's
-build_folds gives, for each test season T, a model trained on all eligible
-seasons < T. So running the stage-1 walk-forward once and capturing each fold's
-TEST-fold scores yields, for every scoreable season, a score from a model that
-never saw that season. No separate inner nesting is needed.
-
-Seasons in the first `min_train_seasons` are never a test fold (pure history), so
-they get no OOF score. This is harmless: those seasons are pre-narrative-era
-(< 2015) and are not residual-training rows anyway.
-
-The stage-1 score MUST come from the STATS-ONLY selection (model_version=None):
-the residual is what stats alone missed.
-
-This module reuses pl_trainer internals (build_folds, factorise_groups,
-_fit_ensemble_parallel, assemble_matrix) rather than reimplementing them, so the
-seal (HELD_OUT_SEASONS excluded in build_folds) is inherited, not re-coded.
-
-British English. season = STARTING year. No em dashes.
+"""Walk-forward out-of-fold scorer: produces the raw per-candidate OOF score bundles (the
+OOF_BUNDLE artefacts pinned in config) used for forward-noise (eta) calibration and for
+the book-weighting skill scores. Originally the stage-one leg of a two-stage
+residual-narrative model; the narrative stage is dead, so this is now the sole OOF
+producer. Has no importers; run directly to regenerate the bundles.
 """
 
 from __future__ import annotations
