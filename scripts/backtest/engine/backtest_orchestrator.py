@@ -1,35 +1,11 @@
-"""
-Season orchestrator for the sized net-exposure backtest (2024 dev season).
+"""Shared-helper library for the backtest engine (no run path of its own).
 
-Ties the built pieces into one weekly-re-solve loop per award, feeding every
-executed fill into trade_ledger for the trade log and the model-vs-strategy
-attribution. v1 uses EQUAL FIXED per-award budgets (three independent bankrolls);
-the outer marginal-growth capital layer (master spec section 10) is deliberately
-NOT built here (it is only meaningful once the growth-vs-capital curve is real,
-and the equal-fixed split is the agreed placeholder).
-
-RUN (locally, on the built DB):
-  uv run python -m scripts.backtest.engine.backtest_orchestrator --season 2024 --budget 5000
-  uv run python -m scripts.backtest.engine.backtest_orchestrator --season 2024 --budget 5000 --awards MVP ROTY DPOY
-
-WHAT THIS CANNOT DO UNTIL YOU CONFIRM THE SEAMS BELOW:
-  Every call marked SEAM touches a module not verifiable from this chat's mount
-  (the mount is a stale pre-trading-layer checkout). They are all collected in
-  the ADAPTERS block so a local traceback points straight at the line to fix.
-  Treat the FIRST run purely as a wiring shakedown, not as PnL.
-
-TWO PREREQUISITES (handoff sections 2 and 5), enforced or flagged here:
-  1. build_samples must expose the eta-widened cloud `sim` (ncand, K*M). The
-     composite risk object must see eta widening or it understates EARLY outcome
-     dispersion (exactly where early restraint should live). We consume
-     samples.sim; if absent we RAISE with the one-line patch rather than silently
-     falling back to bootstrap-only raw_scores.
-  2. The near-touch notional SCALE per price bucket must be sanity-checked on the
-     real engine before the PnL means anything (impact is what stops the sizer
-     piling into cheap longshots). _report_cost_scales() prints them; eyeball
-     before trusting allocations.
-
-British English. No inline comments.
+Holds the pieces the run path imports: A_build_samples (pinned-model scoring and the
+joint-sample builder), the sample-cloud and composite helpers, self_mark, _rebalance_to
+and _close_leg (position stepping), _dump_csv, and the execution constants. The daily
+loop lives in backtest_orchestrator_daily; the entry point is backtest_singlepass.
+Capital is split across books by config.BOOK_WEIGHTS (shrunk skill-weighting), which
+replaced the old equal-fixed placeholder.
 """
 from __future__ import annotations
 import os

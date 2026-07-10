@@ -1,3 +1,8 @@
+"""Positional z-scores: standardise box, advanced and tracking stats within a player's
+position group, so a candidate's production is measured against positional peers rather
+than the league as a whole. Feeds the relative-feature encodings.
+"""
+
 from __future__ import annotations
 
 import logging
