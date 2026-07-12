@@ -36,9 +36,9 @@ PERCENTAGES the EMA is weighted_sum(makes) / weighted_sum(attempts) using the
 SAME per-game weights, because an EMA of a ratio-of-sums is otherwise ill-
 defined; this keeps percentages consistent with the summed-makes/attempts rule.
 
-Run:  uv run python -m src.data.nba_box_asof
-      uv run python -m src.data.nba_box_asof --db data/awards.db
-      uv run python -m src.data.nba_box_asof --season 2024   # one season only
+Run:  uv run python -m scripts.features.asof.nba_box_asof
+      uv run python -m scripts.features.asof.nba_box_asof --db data/awards.db
+      uv run python -m scripts.features.asof.nba_box_asof --season 2024   # one season only
 """
 
 from __future__ import annotations

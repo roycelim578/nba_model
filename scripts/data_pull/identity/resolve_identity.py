@@ -18,8 +18,8 @@ This module is the SOLE writer of `players.player_id`, the SOLE promoter of
 component is what lets the three pullers (nba_api, bref, Polymarket) run in
 parallel keyed by their own native ids without colliding.
 
-Run:  uv run python -m src.data.resolve_identity
-      uv run python -m src.data.resolve_identity --db data/awards.db
+Run:  uv run python -m scripts.data_pull.identity.resolve_identity
+      uv run python -m scripts.data_pull.identity.resolve_identity --db data/awards.db
 
 Idempotent and safely re-runnable as new staging data arrives. A second run
 after more staging lands must NOT renumber existing players (see the synthetic

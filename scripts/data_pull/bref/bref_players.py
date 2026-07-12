@@ -174,7 +174,7 @@ def scrape_players(db_path: str, force_refresh: bool = False) -> dict:
             summary["errors"].append((bref_id, f"parse:{exc}"))
             continue
 
-        upsert(conn, "stg_bref_players", [asdict(row)], conflict_keys=["bref_id"])
+        upsert(conn, "stg_bref_players", [asdict(row)], ["bref_id"])
         summary["players"] += 1
 
     conn.close()

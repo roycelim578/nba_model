@@ -69,16 +69,27 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger("nba_candidate_filter")
 
-AWARDS = ("MVP", "DPOY", "ROTY")
+AWARDS = ("MVP", "DPOY", "ROTY", "6MOTY")
 
 # gp_played floors per award (sample-sanity rateability gate).
-GP_FLOOR = {"MVP": 20, "DPOY": 20, "ROTY": 15}
+GP_FLOOR = {"MVP": 20, "DPOY": 20, "ROTY": 15, "6MOTY": 20}
 
 # production percentile thresholds per award (UNION limbs).
-PCT_FLOOR = {"MVP": 0.90, "DPOY": 0.90, "ROTY": 0.75}
+PCT_FLOOR = {"MVP": 0.90, "DPOY": 0.90, "ROTY": 0.75, "6MOTY": 0.60}
 
 # whether the award has a prior-season carry-in limb.
-HAS_CARRYIN = {"MVP": True, "DPOY": True, "ROTY": False}
+HAS_CARRYIN = {"MVP": True, "DPOY": True, "ROTY": False, "6MOTY": True}
+
+# Bench-gate constants for 6MOTY. Per-game started flags are trustworthy only
+# from 2017 (V3 restricts the position field to actual starters then; earlier
+# seasons over-label). Pre-2017 the bench gate falls back to an mpg band
+# validated at recall 1.0 on the bench-majority set. The starts ratio uses the
+# appearance denominator (gp_asof), matching how a start is credited (at tip-off
+# regardless of minutes), and sums starts only over rows joinable to the game
+# logs so non-appearing listed players do not dilute the count.
+STARTS_CLEAN_FROM = 2017
+BENCH_MPG_LO = 8.0
+BENCH_MPG_HI = 36.0
 
 # Data floor: the first season present in the game logs. ROTY rookie-
 # eligibility (first-game-log-season) cannot be computed for this season
@@ -115,6 +126,62 @@ def _axis_pool_cte(award: str) -> str:
     primitive (PERCENT_RANK within the partition over non-null axis) is shared.
     """
     gp_floor = GP_FLOOR[award]
+
+    if award == "6MOTY":
+        # Bench pool: MVP-style pra/apg axes over the gp-floored box pool,
+        # intersected with the bench gate. started_asof sums per-game start
+        # flags on games on/before the snapshot, joined to the logs so listed
+        # non-appearances (started=0 phantoms) drop out. The season switch is
+        # applied here so percentiles rank bench players against bench players.
+        return f"""
+        starts_asof AS (
+            SELECT s.nba_api_id, b.season, b.snapshot_date,
+                   SUM(CASE WHEN l.game_date <= b.snapshot_date THEN s.started ELSE 0 END) AS started_asof
+            FROM stg_nba_game_starts s
+            JOIN stg_nba_player_game_logs l
+              ON l.nba_api_id = s.nba_api_id AND l.game_id = s.game_id
+            JOIN (SELECT DISTINCT season, snapshot_date FROM stg_nba_box_asof) b
+              ON b.season = s.season
+            GROUP BY s.nba_api_id, b.season, b.snapshot_date
+        ),
+        pool AS (
+            SELECT b.nba_api_id, b.season, b.snapshot_date,
+                   b.gp_played_asof AS gp_played,
+                   b.pra_std AS pra, b.apg_std AS apg,
+                   (COALESCE(b.spg_std,0)+COALESCE(b.bpg_std,0)) AS stocks,
+                   b.gp_asof AS gp_asof, b.mpg_std AS mpg,
+                   COALESCE(sa.started_asof, 0) AS started_asof
+            FROM stg_nba_box_asof b
+            JOIN snapshot_grid g
+              ON g.season = b.season AND g.snapshot_date = b.snapshot_date
+            LEFT JOIN starts_asof sa
+              ON sa.nba_api_id = b.nba_api_id AND sa.season = b.season
+             AND sa.snapshot_date = b.snapshot_date
+            WHERE g.snapshot_kind IN ('weekly','ratings')
+              AND b.gp_played_asof >= {gp_floor}
+              AND (
+                    (b.season >= {STARTS_CLEAN_FROM}
+                       AND b.gp_asof > 0
+                       AND CAST(COALESCE(sa.started_asof, 0) AS REAL) / b.gp_asof < 0.5)
+                 OR (b.season < {STARTS_CLEAN_FROM}
+                       AND b.mpg_std >= {BENCH_MPG_LO} AND b.mpg_std <= {BENCH_MPG_HI})
+                  )
+        ),
+        ranked AS (
+            SELECT p.nba_api_id, p.season, p.snapshot_date, p.gp_played,
+                   PERCENT_RANK() OVER (
+                       PARTITION BY p.season, p.snapshot_date ORDER BY p.pra
+                   ) AS pra_pct,
+                   PERCENT_RANK() OVER (
+                       PARTITION BY p.season, p.snapshot_date ORDER BY p.apg
+                   ) AS apg_pct,
+                   PERCENT_RANK() OVER (
+                       PARTITION BY p.season, p.snapshot_date ORDER BY p.stocks
+                   ) AS stk_pct
+            FROM pool p
+            WHERE p.pra IS NOT NULL
+        )
+        """
 
     if award in ("MVP", "ROTY"):
         # MVP/ROTY axes: pra and apg, both from the box table (gapless).
@@ -272,7 +339,18 @@ def _admitted_rows(conn, award: str, season: int, pulled_at: str) -> list[dict]:
 
     cte = _axis_pool_cte(award).format(rookie_clause=rookie_clause)
 
-    if award in ("MVP", "ROTY"):
+    if award == "6MOTY":
+        sql = f"""
+        WITH {cte}
+        SELECT nba_api_id, season, snapshot_date, gp_played,
+               pra_pct, apg_pct,
+               (pra_pct >= ? OR apg_pct >= ? OR stk_pct >= ?) AS production_limb
+        FROM ranked
+        WHERE season = ?
+        """
+        rows = conn.execute(sql, (pct, pct, pct, season)).fetchall()
+        axis_cols = ("pra_pct", "apg_pct")
+    elif award in ("MVP", "ROTY"):
         sql = f"""
         WITH {cte}
         SELECT nba_api_id, season, snapshot_date, gp_played,

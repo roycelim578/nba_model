@@ -45,7 +45,7 @@ class SizerResultV2:
 
 
 def rank_floor_mask(vote_share_pred, award):
-    n_by_award = {"DPOY": 20, "MVP": 15, "ROTY": 10}
+    n_by_award = {"DPOY": 20, "MVP": 15, "ROTY": 10, "6MOTY": 15}
     n = n_by_award[award]
     v = np.asarray(vote_share_pred, dtype=float)
     mask = np.zeros(v.size, dtype=bool)

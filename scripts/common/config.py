@@ -38,6 +38,7 @@ SEAL_REGISTRY = {
     "MVP": [],
     "DPOY": [],
     "ROTY": [],
+    "6MOTY": [2024, 2025],
 }
 _DEFAULT_SEAL = [2024, 2025]
 

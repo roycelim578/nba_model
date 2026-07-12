@@ -68,6 +68,7 @@ AWARDS: dict[str, dict] = {
     "MVP":  {"table_id": "mvp",  "first_page_year": GLOBAL_FIRST_PAGE_YEAR},
     "DPOY": {"table_id": "dpoy", "first_page_year": 1983},  # 1982-83 inception
     "ROTY": {"table_id": "roy",  "first_page_year": GLOBAL_FIRST_PAGE_YEAR},
+    "6MOTY": {"table_id": "smoy", "first_page_year": 1997},  # 1996-97 floor (game-log floor)
 }
 
 
@@ -287,7 +288,7 @@ def scrape_voting(last_page_year: int, db_path: str, force_refresh: bool = False
                 conn,
                 "stg_award_voting",
                 [asdict(r) for r in rows],
-                conflict_keys=["season", "award", "bref_id"],
+                ["season", "award", "bref_id"],
             )
             summary["rows"] += n
             summary["season_award_ok"] += 1
