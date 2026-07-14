@@ -56,12 +56,12 @@ selection_hash(award, sorted(input_features), params, method).
 
 Run from repo root:
   # validate the reconstruction reproduces the deployed DPOY golden (no write)
-  uv run python -m scripts.features.feature_regularise \
+  uv run python -m scripts.modelling.select.feature_regularise \
       --award DPOY --train-seasons 1996 2023 --threshold 0.95 \
       --golden 826d50bf254354be --validate-against 826d50bf254354be
 
   # mint the 6MOTY selection on the same universe/threshold
-  uv run python -m scripts.features.feature_regularise \
+  uv run python -m scripts.modelling.select.feature_regularise \
       --award 6MOTY --train-seasons 1996 2023 --threshold 0.95 \
       --golden 826d50bf254354be --persist
 
@@ -270,7 +270,8 @@ def persist_selection(conn, selection_id: str, award: str, params: dict,
 
 
 def run(conn, award: str, train_seasons: list[int], threshold: float,
-        min_pairwise_obs: int, golden_id: str | None) -> dict:
+        min_pairwise_obs: int, golden_id: str | None,
+        drop_features: list[str] | None = None) -> dict:
     lo, hi = min(train_seasons), max(train_seasons)
     rows = load_design_matrix(conn, award, seasons=None)
     if not rows:
@@ -280,6 +281,21 @@ def run(conn, award: str, train_seasons: list[int], threshold: float,
     golden = load_golden(conn, golden_id) if golden_id else None
     ref_universe = golden["universe"] if golden else None
     feats = candidate_feature_columns(df, reference_universe=ref_universe)
+
+    drop_set = set(drop_features or [])
+    if drop_set:
+        missing = sorted(drop_set - set(feats))
+        if missing:
+            raise SystemExit(f"--drop-features not in the {award} universe: {missing}")
+        feats = [f for f in feats if f not in drop_set]
+        if golden is not None:
+            golden = dict(golden)
+            golden["universe"] = set(golden["universe"]) - drop_set
+            golden["survivors"] = set(golden["survivors"]) - drop_set
+            golden["map"] = {k: v for k, v in golden["map"].items()
+                             if k not in drop_set and v not in drop_set}
+        log.info("award-scoped drop of %d feature(s) from the %s universe: %s",
+                 len(drop_set), award, sorted(drop_set))
 
     df_train = df[df["season"].between(lo, hi)]
     if df_train.empty:
@@ -391,6 +407,11 @@ def main(argv=None) -> int:
                          "and the survivor-preference / replay map")
     ap.add_argument("--validate-against", default=None,
                     help="selection_id to diff against; prints pass/fail, no write")
+    ap.add_argument("--drop-features", nargs="*", default=None,
+                    help="feature names to remove from the universe for THIS award "
+                         "only; leaves the golden reference untouched. Any golden "
+                         "replay whose survivor is dropped is re-resolved by the "
+                         "representative rule and tagged 'defaulted' for review.")
     ap.add_argument("--persist", action="store_true")
     args = ap.parse_args(argv)
 
@@ -398,7 +419,7 @@ def main(argv=None) -> int:
     try:
         golden_id = args.golden or args.validate_against
         out = run(conn, args.award, args.train_seasons, args.threshold,
-                  args.min_pairwise_obs, golden_id)
+                  args.min_pairwise_obs, golden_id, drop_features=args.drop_features)
         _print_run(out, golden_id)
 
         if args.validate_against:

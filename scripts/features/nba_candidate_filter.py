@@ -157,6 +157,8 @@ def _axis_pool_cte(award: str) -> str:
             LEFT JOIN starts_asof sa
               ON sa.nba_api_id = b.nba_api_id AND sa.season = b.season
              AND sa.snapshot_date = b.snapshot_date
+            LEFT JOIN (SELECT x.nba_api_id AS nid, gs.season AS sea, CAST(gs.gs AS REAL) / gs.g AS gs_ratio FROM stg_bref_nba_crosswalk x JOIN stg_bref_game_starts gs ON gs.bref_id = x.bref_id WHERE gs.g > 0 AND gs.gs IS NOT NULL) bgs
+              ON bgs.nid = b.nba_api_id AND bgs.sea = b.season
             WHERE g.snapshot_kind IN ('weekly','ratings')
               AND b.gp_played_asof >= {gp_floor}
               AND (
@@ -164,7 +166,7 @@ def _axis_pool_cte(award: str) -> str:
                        AND b.gp_asof > 0
                        AND CAST(COALESCE(sa.started_asof, 0) AS REAL) / b.gp_asof < 0.5)
                  OR (b.season < {STARTS_CLEAN_FROM}
-                       AND b.mpg_std >= {BENCH_MPG_LO} AND b.mpg_std <= {BENCH_MPG_HI})
+                       AND bgs.gs_ratio IS NOT NULL AND bgs.gs_ratio < 0.5)
                   )
         ),
         ranked AS (

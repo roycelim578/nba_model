@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 
 try:
+    from scripts.common import config
     from scripts.common.db import connect
     from scripts.features.feature_loader import load_design_matrix
     from scripts.modelling.train.pl_trainer import (
@@ -53,6 +54,7 @@ try:
     from scripts.modelling.train.pl_objective import make_pl_objective, grouped_softmax
 except ImportError:  # pragma: no cover
     sys.path.insert(0, "src")
+    from scripts.common import config  # type: ignore
     from scripts.common.db import connect  # type: ignore
     from scripts.features.feature_loader import load_design_matrix  # type: ignore
     from scripts.modelling.train.pl_trainer import (  # type: ignore
@@ -65,8 +67,10 @@ log = logging.getLogger("retrain_monotone")
 SEALED = {2025}
 MIN_TRAIN = 5
 CONSTRAINED = "carry_years_repeat"
+LABEL_COLS = frozenset({"label_vote_share", "label_won_flag", "label_rank",
+                        "label_first_place_share", "label_first_place_votes"})
 POS_FORCE = ["pos_is_guard", "pos_is_wing", "pos_is_big"]  # force-included; old selection dropped them when the position map was empty
-NUM_BOOST = {"MVP": 250, "DPOY": 250, "ROTY": 100}
+NUM_BOOST = {"MVP": 250, "DPOY": 250, "ROTY": 100, "6MOTY": 100}
 SEED = 17
 OUT = Path("models/folds")
 N_JOBS = 6
@@ -83,7 +87,30 @@ AWARD_ARMS = {
     # ROTY: fatigue moot, so vs + fp are both unconstrained; they are the ROTY jspeak_floor
     # components the backtest previously read from OOF CSVs without persisting boosters.
     "ROTY": [("vs", "label_vote_share", False), ("fp", "label_first_place_share", False)],
+    "6MOTY": [("vs", "label_vote_share", False), ("fp", "label_first_place_share", False)],
 }
+
+
+def _sealed_for(award):
+    """Award-aware sealed-season set for training. The permanent one-shot
+    2025 exclusion (SEALED) unioned with the award's held-out registry entry,
+    so a new award holds out both its dev and test seasons while MVP/DPOY/ROTY
+    keep 2024 in and exclude only 2025 exactly as the bare {2025} did. Reads
+    config.SEAL_REGISTRY, defaulting to config._DEFAULT_SEAL for an
+    unregistered award."""
+    return SEALED | set(config.SEAL_REGISTRY.get(award, config._DEFAULT_SEAL))
+
+
+def _assert_label_free(feat_cols, label_col, award, arm):
+    """Guard against label leakage. The feature matrix must contain no label
+    column, and in particular not the arm's own label_col. Raises before any
+    fit so a mis-minted selection cannot silently train on the answer."""
+    leaked = sorted(set(feat_cols) & (LABEL_COLS | {label_col}))
+    if leaked:
+        raise SystemExit(
+            f"[{award}/{arm}] label leakage: feature set contains label "
+            f"column(s) {leaked}; re-mint the selection with these excluded "
+            f"before training.")
 
 
 def _frame(conn, award):
@@ -169,7 +196,11 @@ def _prepare(conn, award):
     for c in POS_FORCE:
         if c in present and c not in kept:
             kept.append(c)
-    all_seasons = sorted(int(s) for s in df["season"].unique() if s not in SEALED)
+    sealed = _sealed_for(award)
+    all_seasons = sorted(int(s) for s in df["season"].unique() if s not in sealed)
+    leaked = sealed & set(all_seasons)
+    assert not leaked, (
+        f"seal breach: {award} training seasons contain sealed {sorted(leaked)}")
     missing = [c for c in kept if c not in df.columns]
     if missing:
         live_dl = sum(1 for c in df.columns if c.endswith("_delta_leader"))
@@ -195,6 +226,7 @@ def _run_arm(ctx, arm, label_col, add_yr, since, k, k2024):
     all_seasons, sel_id = ctx["all_seasons"], ctx["sel_id"]
     diag_seasons = [s for s in all_seasons if s >= since]
     feat_cols = kept + [CONSTRAINED] if add_yr else list(kept)
+    _assert_label_free(feat_cols, label_col, award, arm)
     tree = _tree_params(feat_cols, add_yr)
     fin = {}
     for T in diag_seasons:
