@@ -70,7 +70,6 @@ COUNT_COLS = [
     "fg3a", "fg3m", "fg2a", "fg2m",
     "fg2a_rim", "fg2m_rim", "fg2a_mid", "fg2m_mid",
     "fta", "ftm", "reb", "potential_ast_asof", "ast",
-    "own_fano_reb", "own_fano_usage",
 ]
 
 
@@ -82,10 +81,6 @@ def _ensure_schema(conn) -> None:
         f"{cols}, pulled_at TEXT, "
         f"PRIMARY KEY (nba_api_id, season, snapshot_date))"
     )
-    have = {r[1] for r in conn.execute("PRAGMA table_info(stat_rate_counts_asof)")}
-    for _c in COUNT_COLS:
-        if _c not in have:
-            conn.execute(f"ALTER TABLE stat_rate_counts_asof ADD COLUMN {_c} REAL")
     conn.commit()
 
 
@@ -153,7 +148,6 @@ def build_season(conn, season, pulled_at):
         games.sort(key=lambda x: x["game_date"])
         gi = 0
         c = {k: 0.0 for k in COUNT_COLS}
-        sr = srr = su = suu = 0.0
         for snap in grid:
             while gi < len(games) and games[gi]["game_date"] <= snap:
                 g = games[gi]
@@ -173,10 +167,6 @@ def build_season(conn, season, pulled_at):
                     c["fta"] += fta; c["ftm"] += g["ftm"] or 0.0
                     c["reb"] += g["rebounds"] or 0.0
                     c["ast"] += g["assists"] or 0.0
-                    reb_g = g["rebounds"] or 0.0
-                    use_g = fga + FT_POSS_COEF * fta + tov
-                    sr += reb_g; srr += reb_g * reb_g
-                    su += use_g; suu += use_g * use_g
                 gi += 1
             # rim/mid apportionment of banked fg2 by point-share proxy at this snap
             paint, mr = pshare.get(pid, {}).get(snap, (None, None))
@@ -189,12 +179,6 @@ def build_season(conn, season, pulled_at):
             c["fg2a_mid"] = c["fg2a"] * (1 - frac_rim)
             c["fg2m_mid"] = c["fg2m"] * (1 - frac_rim)
             c["potential_ast_asof"] = potast.get(pid, {}).get(snap, 0.0)
-            n_g = c["gp_played_asof"]
-            if n_g > 0:
-                _mr = sr / n_g
-                c["own_fano_reb"] = max((srr / n_g - _mr * _mr) / _mr, 0.0) if _mr > 0 else 0.0
-                _mu = su / n_g
-                c["own_fano_usage"] = max((suu / n_g - _mu * _mu) / _mu, 0.0) if _mu > 0 else 0.0
             if c["gp_played_asof"] > 0:
                 row = {"nba_api_id": pid, "season": season, "snapshot_date": snap,
                        "pulled_at": pulled_at}

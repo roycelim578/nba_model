@@ -51,22 +51,14 @@ try:
     from scripts.features.stat_leader import volume as V
     from scripts.features.stat_leader import availability as A
     from scripts.features.stat_leader import minutes as MIN
-    from scripts.features.stat_leader import reb_env as RENV
     from scripts.features.stat_leader import avail_hier as AH
-    from scripts.features.stat_leader import corr2 as C2
-    from scripts.features.stat_leader import correlation as CORR_MOD
-    from scripts.features.stat_leader import fano_hier as FH
 except ImportError:  # pragma: no cover
     from db import connect  # type: ignore
     import nodes as N  # type: ignore
     import volume as V  # type: ignore
     import availability as A  # type: ignore
     import minutes as MIN  # type: ignore
-    import reb_env as RENV  # type: ignore
     import avail_hier as AH  # type: ignore
-    import corr2 as C2  # type: ignore
-    import correlation as CORR_MOD  # type: ignore
-    import fano_hier as FH  # type: ignore
 
 log = logging.getLogger("stat_leader.mc")
 
@@ -80,29 +72,13 @@ FT_POSS_COEF = 0.44
 # minutes leg, GAMES_K on the remaining-games fraction.
 MPG_K = None
 GAMES_K = None
-# Shared rebounding-environment factor (REB only, see reb_env.py). REB_ENV_VAR is
-# the measured dispersion of the mean-1 factor; 0 disables (identical engine).
-# _REB_ENV holds the current snapshot's shared draw, set in _eff_matrix.
-REB_ENV_VAR = 0.0
-_REB_ENV = None
 # Own-history prior (see volume.rate_posterior). None disables (cohort-only prior,
 # identical engine); when set to a pseudo-minute strength the rate prior mean is
 # blended toward the player's prior-season rate. Driver sets it from V.REF_MIN.
 OWN_PRIOR_K = None
-# Hierarchical availability recentre (avail_hier.py) and heterogeneous v2
-# correlation (corr2.py). Off => identical engine.
+# Hierarchical availability recentre (avail_hier.py). Off => identical engine.
 AVAIL_HIER = False
-CORR2 = False
-_CORR2_MULT = None
 _AVAIL_PRIOR = None
-_CORR2_SD = None
-# Named-driver correlation (see correlation.py). False disables (no remaining-
-# opponent nudge, identical engine); True applies the measured mu-sharpening.
-CORR = False
-# Hierarchical per-game fano (see fano_hier.py). False disables (global fano,
-# identical engine); True redistributes dispersion by own-history -> mpg x
-# volume cohort -> league. Driver sets it from the --hier-fano flag.
-HIER_FANO = False
 
 STAT_AWARD = {"pts": "PTS", "reb": "REB", "ast": "AST"}
 VOL_NODE = {"reb": "reb", "pts": "usage", "ast": "ast_create"}
@@ -125,44 +101,6 @@ BANKED = {"reb": _banked_reb, "pts": _banked_pts, "ast": _banked_ast}
 
 def _qual(ftg):
     return math.ceil(QUAL_FRAC * ftg)
-
-
-def _fano(vpriors, node, d):
-    """Per-game fano for a contender: the global coverage-matched scalar, or,
-    when HIER_FANO is on, the hierarchical own->cohort->league redistribution.
-    Backs off to the global scalar whenever the hierarchy or the inputs are
-    absent (e.g. ast_create), so it is identical to the base engine off."""
-    base = vpriors["fano"].get(node, 1.0)
-    if not HIER_FANO:
-        return base
-    hier = vpriors.get("fano_hier")
-    if not hier:
-        return base
-    vc, vm = V._vol_count(d, node)
-    gp = d.get("gp_played_asof") or 0.0
-    if vc is None or vm <= 0 or gp <= 0:
-        return base
-    of = d.get(FH.OWN_FANO_COL[node]) if node in FH.OWN_FANO_COL else None
-    return FH.fano_for(hier, node, vc / vm, vm / gp, of, gp)
-
-
-def _corr_mu(vpriors, node, d):
-    """Deterministic remaining-opponent nudge: measured BETA times the
-    standardised softness of the contender's remaining schedule. 1.0 when
-    correlation is off or the driver is unavailable, so it nests to base."""
-    if not CORR:
-        return 1.0
-    b = vpriors.get("corr_beta", {}).get(node)
-    z = d.get("opp_z")
-    if b is None or z is None:
-        return 1.0
-    return min(1.10, max(0.90, 1.0 + b * z))
-
-
-def _c2mul(rate):
-    """Multiply a contender rate by his per-replicate opponent shock when v2
-    correlation is on; identity otherwise (_CORR2_MULT stays None)."""
-    return rate if _CORR2_MULT is None else rate * _CORR2_MULT
 
 
 def _gamma_rate(rng, priors, node, cohort, vc, vm, k, own_rate=None, own_min=0.0):
@@ -189,11 +127,7 @@ def _rem_reb(rng, d, cohort, vpriors, npriors, rem_min, k):
         return np.zeros(k)
     rate = _gamma_rate(rng, vpriors, "reb", cohort, vc, vm, k,
                        own_rate=d.get("prior_rate_reb"), own_min=d.get("prior_min") or 0.0)
-    rate = _c2mul(rate)
-    rate = rate * _corr_mu(vpriors, "reb", d)
-    if _REB_ENV is not None:
-        rate = rate * _REB_ENV
-    return V._draw_count(rng, rate, rem_min, _fano(vpriors, "reb", d))
+    return V._draw_count(rng, rate, rem_min, vpriors["fano"].get("reb", 1.0))
 
 
 def _rem_ast(rng, d, cohort, vpriors, npriors, rem_min, k):
@@ -202,9 +136,7 @@ def _rem_ast(rng, d, cohort, vpriors, npriors, rem_min, k):
         return np.zeros(k)
     rate = _gamma_rate(rng, vpriors, "ast_create", cohort, vc, vm, k,
                        own_rate=d.get("prior_rate_ast_create"), own_min=d.get("prior_min") or 0.0)
-    rate = _c2mul(rate)
-    rate = rate * _corr_mu(vpriors, "ast_create", d)
-    pot = V._draw_count(rng, rate, rem_min, _fano(vpriors, "ast_create", d))
+    pot = V._draw_count(rng, rate, rem_min, vpriors["fano"].get("ast_create", 1.0))
     conv = _beta_draw(rng, npriors, "ast_conv", cohort, d, "ast", "potential_ast_asof", k)
     return pot * conv
 
@@ -215,9 +147,7 @@ def _rem_pts(rng, d, cohort, vpriors, npriors, rem_min, k):
         return np.zeros(k)
     rate = _gamma_rate(rng, vpriors, "usage", cohort, vc, vm, k,
                        own_rate=d.get("prior_rate_usage"), own_min=d.get("prior_min") or 0.0)
-    rate = _c2mul(rate)
-    rate = rate * _corr_mu(vpriors, "usage", d)
-    used = V._draw_count(rng, rate, rem_min, _fano(vpriors, "usage", d)).astype(float)
+    used = V._draw_count(rng, rate, rem_min, vpriors["fano"].get("usage", 1.0)).astype(float)
     od = npriors.get("node_od", {}).get("fg2", 0.5)
     s_alloc = _dir_draw(rng, npriors, "alloc", cohort,
                         [d.get("used_fga") or 0.0, d.get("used_ft_trip") or 0.0, d.get("used_tov") or 0.0], od, k)
@@ -306,21 +236,6 @@ def _snap_seed(season, stat, snap):
 def _eff_matrix(stat, season, snap, field, counts, ctx_snap, vpriors, npriors,
                 pools, tcut, pos, firstyr, k):
     rng = np.random.default_rng(_snap_seed(season, stat, snap))
-    global _REB_ENV
-    _REB_ENV = None
-    if stat == "reb" and REB_ENV_VAR and REB_ENV_VAR > 0:
-        v = float(REB_ENV_VAR)
-        _REB_ENV = rng.gamma(1.0 / v, v, size=k)
-    global _CORR2_MULT
-    _CORR2_MULT = None
-    team_shocks = None
-    if CORR2:
-        teams = set()
-        for _p in field:
-            _w = counts[(season, snap, _p)].get("opp_w")
-            if _w:
-                teams.update(_w)
-        team_shocks = C2.draw_team_shocks(rng, teams, _CORR2_SD or C2.DEFAULT_SD, k)
     branch = BRANCH[stat]
     eff = np.zeros((len(field), k), dtype=float)
     for i, pid in enumerate(field):
@@ -335,7 +250,6 @@ def _eff_matrix(stat, season, snap, field, counts, ctx_snap, vpriors, npriors,
             continue
         if AVAIL_HIER and _AVAIL_PRIOR is not None:
             rf, rm = AH.recentre(rf, rm, rc, d, pid, season, _AVAIL_PRIOR)
-        _CORR2_MULT = C2.contender_mult(d.get("opp_w"), team_shocks, k) if team_shocks is not None else None
         banked_mpg = (mn / gp) if gp else 0.0
         rm = np.where(np.isnan(rm), banked_mpg, rm)
         if GAMES_K is not None:
@@ -413,14 +327,9 @@ def load_all(conn, eval_season, fit_lookback=10):
     pools = A.fit(train_recs, tcut)
     mpg_k = MIN.fit_shrink_k(conn, train_recs, pools, tcut, list(range(fit_lo, fit_hi + 1)))
     games_k = MIN.fit_shrink_kg(conn, train_recs, pools, tcut, list(range(fit_lo, fit_hi + 1)))
-    reb_env_var = RENV.fit_env_var(counts, finals)
-    global _AVAIL_PRIOR, _CORR2_SD
+    global _AVAIL_PRIOR
     if AVAIL_HIER:
         _AVAIL_PRIOR = AH.fit(conn, list(range(fit_lo, fit_hi + 1)))
-    if CORR2:
-        _CORR2_SD = C2.fit_sd()
-    if CORR:
-        vpriors["corr_beta"] = CORR_MOD.fit_beta(conn, list(range(fit_lo, fit_hi + 1)))
     for (s, snap, pid), d in counts.items():
         fprev = finals.get((s - 1, pid))
         if not fprev:
@@ -435,14 +344,10 @@ def load_all(conn, eval_season, fit_lookback=10):
                 d[f"prior_rate_{node}"] = cnt / mn
     ctx = _load_context(conn, eval_season)
     ftg = _load_ftg(conn, eval_season)
-    if CORR2:
-        C2.attach_weights(conn, counts, ctx, eval_season)
-    if CORR:
-        CORR_MOD.attach_opp_z(conn, counts, ctx, eval_season)
     return dict(counts=counts, finals=finals, pos=pos, firstyr=firstyr,
                 vpriors=vpriors, npriors=npriors, pools=pools, tcut=tcut,
                 ctx=ctx, ftg=ftg, mpg_k=mpg_k, games_k=games_k,
-                reb_env_var=reb_env_var, fit_lo=fit_lo, fit_hi=fit_hi)
+                fit_lo=fit_lo, fit_hi=fit_hi)
 
 
 def _seal_check(stat, season):
@@ -473,9 +378,8 @@ def main(argv=None):
     conn.close()
     globals()["MPG_K"] = B["mpg_k"]
     globals()["GAMES_K"] = B["games_k"]
-    globals()["REB_ENV_VAR"] = B["reb_env_var"]
-    log.info("measured shrinks: minutes K=%.0f games Kg=%.0f; reb env var=%.4f; own_prior_K=%s",
-             B["mpg_k"], B["games_k"], B["reb_env_var"], OWN_PRIOR_K)
+    log.info("measured shrinks: minutes K=%.0f games Kg=%.0f; own_prior_K=%s",
+             B["mpg_k"], B["games_k"], OWN_PRIOR_K)
 
     snaps = sorted({snap for (s, snap, _) in B["counts"] if s == args.eval_season})
     if not snaps:

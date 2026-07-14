@@ -72,11 +72,6 @@ try:
 except ImportError:  # pragma: no cover
     from nodes import _load, _cohort, MIN_MPG, MIN_COHORT  # type: ignore
 
-try:
-    from scripts.features.stat_leader import fano_hier as _FH
-except ImportError:  # pragma: no cover
-    import fano_hier as _FH  # type: ignore
-
 log = logging.getLogger("stat_leader.volume")
 
 REF_MIN = 300.0            # reference banked minutes at which a slope-1 node is
@@ -188,7 +183,6 @@ def fit_priors(counts, finals, pos, firstyr):
     # per-game overdispersion, coverage-matched on the training remaining-count
     # predictive (needs the rate posterior above, so it runs last).
     priors["fano"] = _fit_fano(priors, counts, finals, pos, firstyr)
-    priors["fano_hier"] = _FH.fit(counts, finals, pos, firstyr, priors["fano"], mpg_cuts)
     return priors
 
 

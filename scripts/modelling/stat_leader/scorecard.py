@@ -29,10 +29,12 @@ import numpy as np
 try:
     from scripts.common.db import connect
     from scripts.modelling.stat_leader import mc as MC
+    from scripts.modelling.stat_leader import calib as CB
     from scripts.features.stat_leader import minutes as MIN
 except ImportError:  # pragma: no cover
     from db import connect  # type: ignore
     import mc as MC  # type: ignore
+    import calib as CB  # type: ignore
     import minutes as MIN  # type: ignore
 
 log = logging.getLogger("stat_leader.scorecard")
@@ -59,12 +61,15 @@ def collect(B, season, stat, k, field_n):
     snaps = sorted(B["ctx"].keys())
     rows = []
     for si, snap in enumerate(snaps):
+        if leader not in B["ctx"].get(snap, {}):   # cleanup: realised leader frozen out (rem_team<=0)
+            continue
         field, p_lead, p_top3 = MC.snapshot_probs(
             stat, season, snap, B["counts"], B["ctx"], B["vpriors"], B["npriors"],
             B["pools"], B["tcut"], B["pos"], B["firstyr"], k, field_n)
         if not field:
             continue
         ph = _phase(si, len(snaps))
+        fr = si / max(1, len(snaps) - 1)
         for i, pid in enumerate(field):
             d = B["counts"].get((season, snap, pid), {})
             gp = d.get("gp_played_asof") or 0.0
@@ -72,7 +77,7 @@ def collect(B, season, stat, k, field_n):
             rows.append({"season": season, "snap": snap, "pid": pid,
                          "p_lead": float(p_lead[i]), "p_top3": float(p_top3[i]),
                          "y_lead": 1 if pid == leader else 0,
-                         "y_top3": 1 if pid in top3 else 0, "phase": ph, "bpg": bpg})
+                         "y_top3": 1 if pid in top3 else 0, "phase": ph, "bpg": bpg, "frac": fr})
     return rows
 
 
@@ -182,12 +187,9 @@ def main(argv=None):
     p.add_argument("--k", type=int, default=MC.DEFAULT_K)
     p.add_argument("--field-n", type=int, default=MC.FIELD_N)
     p.add_argument("--no-shrink", action="store_true", help="disable the measured minutes/games shrink")
-    p.add_argument("--no-reb-env", action="store_true", help="disable the shared rebounding-environment factor")
     p.add_argument("--own-prior", action="store_true", help="blend the rate prior mean toward the player's prior-season rate")
     p.add_argument("--avail-hier", action="store_true", help="hierarchical availability recentre (own history for the centre)")
-    p.add_argument("--corr2", action="store_true", help="v2 correlation: heterogeneous per-opponent shared shock")
-    p.add_argument("--corr", action="store_true", help="named-driver correlation: measured remaining-opponent mu-sharpening")
-    p.add_argument("--hier-fano", action="store_true", help="hierarchical per-game fano (own-history -> mpg x volume cohort -> league)")
+    p.add_argument("--beta", action="store_true", help="apply the walk-forward Beta calibration to P(lead) before scoring")
     args = p.parse_args(argv)
 
     stats = ["reb", "pts", "ast"] if args.stat == "all" else [args.stat]
@@ -201,32 +203,33 @@ def main(argv=None):
             assert_not_sealed(MC.STAT_AWARD[st], s)
 
     pooled = {st: [] for st in stats}
-    kvals = defaultdict(list); kgvals = defaultdict(list); envvals = defaultdict(list)
+    kvals = defaultdict(list); kgvals = defaultdict(list)
     conn = connect(args.db)
     for s in seasons:
         active = [st for st in stats if s >= STAT_FLOOR[st]]
         if not active:
             continue
-        MC.CORR = bool(args.corr)
-        MC.AVAIL_HIER = bool(args.avail_hier); MC.CORR2 = bool(args.corr2)
+        MC.AVAIL_HIER = bool(args.avail_hier)
         try:
             B = MC.load_all(conn, s, args.fit_lookback)
         except Exception as e:
             log.warning("season %d skipped (%s)", s, e); continue
         MC.MPG_K = None if args.no_shrink else B["mpg_k"]
         MC.GAMES_K = None if args.no_shrink else B["games_k"]
-        MC.REB_ENV_VAR = 0.0 if args.no_reb_env else B["reb_env_var"]
         MC.OWN_PRIOR_K = MC.V.REF_MIN if args.own_prior else None
-        MC.HIER_FANO = bool(args.hier_fano)
-        log.info("season %d: fit rolling %d-%d, minutesK=%.0f gamesKg=%.0f rebEnvVar=%.4f own_prior=%s%s", s,
-                 s - args.fit_lookback, s - 1, B["mpg_k"], B["games_k"], B["reb_env_var"],
+        log.info("season %d: fit rolling %d-%d, minutesK=%.0f gamesKg=%.0f own_prior=%s%s", s,
+                 s - args.fit_lookback, s - 1, B["mpg_k"], B["games_k"],
                  bool(args.own_prior), " (SHRINK OFF)" if args.no_shrink else "")
         for st in active:
             kvals[st].append(B["mpg_k"]); kgvals[st].append(B["games_k"])
-            envvals[st].append(B["reb_env_var"])
             pooled[st].extend(collect(B, s, st, args.k, args.field_n))
     conn.close()
-    MC.MPG_K = None; MC.GAMES_K = None; MC.REB_ENV_VAR = 0.0; MC.OWN_PRIOR_K = None; MC.AVAIL_HIER = False; MC.CORR2 = False; MC.CORR = False; MC.HIER_FANO = False
+    MC.MPG_K = None; MC.GAMES_K = None; MC.OWN_PRIOR_K = None; MC.AVAIL_HIER = False
+
+    if args.beta:
+        for st in stats:
+            if pooled[st]:
+                pooled[st] = CB.calibrate_plead_walkforward(pooled[st])
 
     for st in stats:
         if not pooled[st]:
@@ -234,25 +237,18 @@ def main(argv=None):
         n_seas = len({r["season"] for r in pooled[st]})
         kmed = float(np.median(kvals[st])) if kvals[st] else float("nan")
         kgmed = float(np.median(kgvals[st])) if kgvals[st] else float("nan")
-        envmed = float(np.median(envvals[st])) if envvals[st] else 0.0
         if args.no_shrink:
             tag = "SHRINK OFF"
         else:
             mtag = "off" if kmed >= MIN.NO_SHRINK else f"K~{kmed:.0f}"
             gtag = "off" if kgmed >= MIN.NO_SHRINK else f"Kg~{kgmed:.0f}"
             tag = f"minutes={mtag} games={gtag}"
-        if st == "reb":
-            tag += f" reb_env={'off' if args.no_reb_env or envmed <= 0 else f'var~{envmed:.4f}'}"
         if args.own_prior:
             tag += " own_prior=on"
         if args.avail_hier:
             tag += " avail_hier=on"
-        if args.corr2:
-            tag += " corr2=on"
-        if args.corr:
-            tag += " corr=on"
-        if args.hier_fano:
-            tag += " hier_fano=on"
+        if args.beta:
+            tag += " beta=on"
         print("\n" + "=" * 94)
         print(f"stat={st}  seasons={n_seas}  rows={len(pooled[st])}  [{tag}]")
         summary(st, pooled[st])

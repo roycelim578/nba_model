@@ -1,15 +1,7 @@
-"""Stat-leader arm: calibration primitives (filter, Beta map, diagnostics).
+"""Stat-leader arm: P(lead) calibration (Beta map, walk-forward driver, diagnostics).
 
-Pure functions, no I/O, no parallelism, so the maths can be checked in isolation.
-
-reachability_variants: from one eff matrix (contenders x draws), compute baseline
-P(lead)/P(top3) and the filtered versions for a list of catch-up quantiles in a
-single pooled pass. A trailing candidate is dropped when his optimistic finish
-(the 1-q quantile of his eff draws) cannot reach the front-runner's pessimistic
-finish (the q quantile of the leader's eff draws); P(lead) is then recomputed as
-the argmax over the admitted set only, so dropped names get exactly zero and the
-admitted vector still sums to one. Smaller q compares more extreme tails and
-drops fewer; larger q is stricter. The field narrows on its own as games run out.
+Pure functions plus one orchestration driver, no I/O and no parallelism, so the
+maths can be checked in isolation.
 
 beta_fit / beta_apply: Beta calibration as logistic regression in log-odds space.
     logit(p_cal) = a(f)*log(p) + b(f)*log(1-p) + c(f)
@@ -21,53 +13,19 @@ map or a temperature cannot. Fitted by IRLS to log-loss on per-candidate binary
 outcomes (marginal calibration); the exclusivity constraint is imposed at apply
 time by renormalising within the snapshot. Temperature is the degenerate case
 where the two slopes are tied and c=0, which is why it failed on this S-shape.
+
+calibrate_plead_walkforward: the locked P(lead) calibration procedure. Fit the map
+on strictly-earlier seasons, apply per snapshot, renormalise within the snapshot.
+This is the single entry point the pricing/backtest layer calls.
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 import numpy as np
 
 EPS = 1e-6
-
-
-# --------------------------------------------------------------------------- #
-# reachability filter (pooled over quantiles)
-# --------------------------------------------------------------------------- #
-
-def _plead_ptop3(eff):
-    k = eff.shape[1]
-    lead = np.bincount(np.argmax(eff, axis=0), minlength=eff.shape[0]) / k
-    t3 = np.zeros(eff.shape[0])
-    order = np.argsort(-eff, axis=0)[:3, :]
-    for r in range(min(3, eff.shape[0])):
-        t3 += np.bincount(order[r], minlength=eff.shape[0])
-    return lead, t3 / k
-
-
-def reachability_variants(eff, qs):
-    """Return {'base': (plead, ptop3, n)} plus {q: (plead, ptop3, n_admit)} for
-    each q, all from the one eff matrix. plead/ptop3 are full-length (dropped
-    candidates carry zero)."""
-    F, k = eff.shape
-    out = {}
-    base_l, base_3 = _plead_ptop3(eff)
-    out["base"] = (base_l, base_3, F)
-    med = np.median(eff, axis=1)
-    leader = int(np.argmax(med))
-    hi = np.quantile(eff, 1.0 - np.array(qs), axis=1)   # (len(qs), F) optimistic per candidate
-    lead_pess = np.quantile(eff[leader], qs)            # (len(qs),) leader pessimistic
-    for j, q in enumerate(qs):
-        admit = hi[j] >= lead_pess[j]
-        admit[leader] = True
-        idx = np.where(admit)[0]
-        sub = eff[idx]
-        l = np.zeros(F)
-        t = np.zeros(F)
-        sl, st = _plead_ptop3(sub)
-        l[idx] = sl
-        t[idx] = st
-        out[q] = (l, t, int(idx.size))
-    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +78,42 @@ def beta_apply(p, f, w):
 def renorm_snapshot(pcal):
     s = float(np.sum(pcal))
     return pcal / s if s > 0 else pcal
+
+
+# --------------------------------------------------------------------------- #
+# Locked walk-forward driver
+# --------------------------------------------------------------------------- #
+
+def calibrate_plead_walkforward(rows, min_prior=3):
+    """Locked P(lead) calibration. Fit the stage-conditioned Beta map walk-forward
+    (on seasons strictly before the eval season, needing >= min_prior prior
+    seasons), apply it to each snapshot's P(lead) and renormalise within the
+    snapshot so the book stays exclusive. Seasons without enough history pass
+    through unchanged. Rows need season, snap, frac, p_lead, y_lead; returns new
+    row dicts with p_lead replaced by the calibrated value (all other keys copied
+    through)."""
+    seasons = sorted({r["season"] for r in rows})
+    by_season = defaultdict(list)
+    for r in rows:
+        by_season[r["season"]].append(r)
+    out = []
+    for s in seasons:
+        prior = [r for r in rows if r["season"] < s]
+        if len({r["season"] for r in prior}) < min_prior:
+            out.extend({**r} for r in by_season[s])
+            continue
+        w = beta_fit([r["p_lead"] for r in prior],
+                     [r["y_lead"] for r in prior],
+                     [r["frac"] for r in prior])
+        grp = defaultdict(list)
+        for r in by_season[s]:
+            grp[(r["season"], r["snap"])].append(r)
+        for _, rws in grp.items():
+            pc = beta_apply([r["p_lead"] for r in rws], [r["frac"] for r in rws], w)
+            pc = renorm_snapshot(pc)
+            for r, pv in zip(rws, pc):
+                out.append({**r, "p_lead": float(pv)})
+    return out
 
 
 # --------------------------------------------------------------------------- #

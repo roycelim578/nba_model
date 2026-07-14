@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover
 log = logging.getLogger("stat_leader.prior_cache")
 
 CACHE_DIR = "models/stat_leader"
-_PRIOR_KEYS = ("vpriors", "npriors", "pools", "tcut", "reb_env_var",
+_PRIOR_KEYS = ("vpriors", "npriors", "pools", "tcut",
                "mpg_k", "games_k", "pos", "firstyr")
 
 
@@ -85,6 +85,6 @@ def load(conn, season, lookback, refit=False):
              pos=blob["pos"], firstyr=blob["firstyr"],
              vpriors=blob["vpriors"], npriors=blob["npriors"],
              pools=blob["pools"], tcut=blob["tcut"],
-             reb_env_var=blob["reb_env_var"], mpg_k=blob["mpg_k"],
+             mpg_k=blob["mpg_k"],
              games_k=blob["games_k"])
     return B, blob["avail_prior"]
