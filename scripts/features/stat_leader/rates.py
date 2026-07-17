@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -64,12 +65,73 @@ log = logging.getLogger("stat_leader.rates")
 DEFAULT_DB_PATH = Path("data/awards.db")
 FT_POSS_COEF = 0.44
 
+
+def _envf(name):
+    v = os.environ.get(name)
+    return float(v) if v not in (None, "") else None
+
+
+K_USAGE = _envf("VOL_WINSOR_K_USAGE")
+K_REB = _envf("VOL_WINSOR_K_REB")
+K_POTAST = _envf("VOL_WINSOR_K_POTAST")
+K_STL = _envf("VOL_WINSOR_K_STL")
+K_BLK = _envf("VOL_WINSOR_K_BLK")
+REF_SEED_MIN = float(os.environ.get("VOL_ROBUST_SEED_MIN", "48"))
+REF_HL_MIN = float(os.environ.get("VOL_ROBUST_HL_MIN", "500"))
+MIN_GAMES = int(os.environ.get("VOL_WINSOR_MIN_GAMES", "5"))
+
+
+class _RunRef:
+    """EWMA of the (possibly capped) per-minute rate, seeded by a league rate
+    with REF_SEED_MIN pseudo-minutes so it is not undefined on game one. Half-life
+    REF_HL_MIN minutes: a stable anchor, not itself chasing recent form. Updated
+    with the value actually used (raw below the cap, the cap itself when a game
+    is clipped), so a single blowout cannot inflate its own reference, but a
+    sustained genuine step-change still migrates the reference up over a few
+    games, at which point the cap stops firing on it. The current game/window is
+    never in its own reference."""
+    __slots__ = ("num", "den", "hl")
+
+    def __init__(self, mu0, w0, hl):
+        self.num = mu0 * w0
+        self.den = w0
+        self.hl = hl
+
+    def mean(self):
+        return self.num / self.den if self.den > 0 else 0.0
+
+    def update(self, mn, r_used):
+        dec = 0.5 ** (mn / self.hl) if self.hl and self.hl > 0 else 1.0
+        self.num = self.num * dec + mn * r_used
+        self.den = self.den * dec + mn
+
+
+def _winsor_factor(count_g, mn, ref, k, gp, min_games):
+    """Scale factor for a count over a span of minutes (one game, or one
+    snapshot window) so its implied rate is capped at k times the running
+    reference, upper tail only; below the cap, or with k unset, or before
+    min_games of the player's own history have accrued, the game passes through
+    unchanged. Always updates the reference with the value actually used, so the
+    reference matures from game one even while the cap itself is held off."""
+    if mn <= 0.0 or count_g <= 0.0:
+        return 1.0
+    r = count_g / mn
+    if k is None or gp < min_games:
+        ref.update(mn, r)
+        return 1.0
+    cap = k * ref.mean()
+    if cap <= 0.0 or r <= cap:
+        ref.update(mn, r)
+        return 1.0
+    ref.update(mn, cap)
+    return cap / r
+
 COUNT_COLS = [
     "gp_played_asof", "min_asof",
     "used_fga", "used_ft_trip", "used_tov",
     "fg3a", "fg3m", "fg2a", "fg2m",
     "fg2a_rim", "fg2m_rim", "fg2a_mid", "fg2m_mid",
-    "fta", "ftm", "reb", "potential_ast_asof", "ast",
+    "fta", "ftm", "reb", "stl", "blk", "potential_ast_asof", "ast",
 ]
 
 
@@ -102,7 +164,7 @@ def _load_logs(conn, season):
     by = defaultdict(list)
     for r in conn.execute(
         "SELECT nba_api_id, game_date, minutes, points, rebounds, assists, "
-        "turnovers, fga, fgm, fg3a, fg3m, fta, ftm "
+        "steals, blocks, turnovers, fga, fgm, fg3a, fg3m, fta, ftm "
         "FROM stg_nba_player_game_logs WHERE season=? AND minutes IS NOT NULL "
         "ORDER BY nba_api_id, game_date", (season,)):
         by[r["nba_api_id"]].append(dict(r))
@@ -143,11 +205,43 @@ def build_season(conn, season, pulled_at):
     pshare = _load_pointshare(conn, season)
     potast = _load_potast(conn, season)
 
+    _tot_min = _tot_used = _tot_reb = _tot_stl = _tot_blk = 0.0
+    for _games in logs.values():
+        for _g in _games:
+            _mn = _g["minutes"] or 0.0
+            if _mn <= 0:
+                continue
+            _tot_min += _mn
+            _tot_used += (_g["fga"] or 0.0) + FT_POSS_COEF * (_g["fta"] or 0.0) + (_g["turnovers"] or 0.0)
+            _tot_reb += _g["rebounds"] or 0.0
+            _tot_stl += _g["steals"] or 0.0
+            _tot_blk += _g["blocks"] or 0.0
+    mu0_usage = (_tot_used / _tot_min) if _tot_min > 0 else 0.0
+    mu0_reb = (_tot_reb / _tot_min) if _tot_min > 0 else 0.0
+    mu0_stl = (_tot_stl / _tot_min) if _tot_min > 0 else 0.0
+    mu0_blk = (_tot_blk / _tot_min) if _tot_min > 0 else 0.0
+    _tot_potast = _tot_potast_min = 0.0
+    for _pid, _vals in potast.items():
+        if not _vals:
+            continue
+        _last = _vals[max(_vals)]
+        _pmin = sum((_g["minutes"] or 0.0) for _g in logs.get(_pid, []) if (_g["minutes"] or 0) > 0)
+        if _pmin > 0:
+            _tot_potast += _last; _tot_potast_min += _pmin
+    mu0_potast = (_tot_potast / _tot_potast_min) if _tot_potast_min > 0 else 0.0
+
     out = []
     for pid, games in logs.items():
         games.sort(key=lambda x: x["game_date"])
         gi = 0
         c = {k: 0.0 for k in COUNT_COLS}
+        ref_u = _RunRef(mu0_usage, REF_SEED_MIN, REF_HL_MIN)
+        ref_r = _RunRef(mu0_reb, REF_SEED_MIN, REF_HL_MIN)
+        ref_s = _RunRef(mu0_stl, REF_SEED_MIN, REF_HL_MIN)
+        ref_b = _RunRef(mu0_blk, REF_SEED_MIN, REF_HL_MIN)
+        ref_p = _RunRef(mu0_potast, REF_SEED_MIN, REF_HL_MIN)
+        _prev_potast_raw = 0.0
+        _prev_min_at_potast = 0.0
         for snap in grid:
             while gi < len(games) and games[gi]["game_date"] <= snap:
                 g = games[gi]
@@ -159,13 +253,23 @@ def build_season(conn, season, pulled_at):
                     fg3a = g["fg3a"] or 0.0; fg3m = g["fg3m"] or 0.0
                     fgm = g["fgm"] or 0.0
                     fg2a = fga - fg3a; fg2m = fgm - fg3m
-                    c["used_fga"] += fga
-                    c["used_ft_trip"] += FT_POSS_COEF * fta
-                    c["used_tov"] += tov
+                    reb_g = g["rebounds"] or 0.0
+                    stl_g = g["steals"] or 0.0
+                    blk_g = g["blocks"] or 0.0
+                    used_g = fga + FT_POSS_COEF * fta + tov
+                    f_u = _winsor_factor(used_g, mn, ref_u, K_USAGE, c["gp_played_asof"], MIN_GAMES)
+                    f_r = _winsor_factor(reb_g, mn, ref_r, K_REB, c["gp_played_asof"], MIN_GAMES)
+                    f_s = _winsor_factor(stl_g, mn, ref_s, K_STL, c["gp_played_asof"], MIN_GAMES)
+                    f_b = _winsor_factor(blk_g, mn, ref_b, K_BLK, c["gp_played_asof"], MIN_GAMES)
+                    c["used_fga"] += fga * f_u
+                    c["used_ft_trip"] += FT_POSS_COEF * fta * f_u
+                    c["used_tov"] += tov * f_u
                     c["fg3a"] += fg3a; c["fg3m"] += fg3m
                     c["fg2a"] += fg2a; c["fg2m"] += fg2m
                     c["fta"] += fta; c["ftm"] += g["ftm"] or 0.0
-                    c["reb"] += g["rebounds"] or 0.0
+                    c["reb"] += reb_g * f_r
+                    c["stl"] += stl_g * f_s
+                    c["blk"] += blk_g * f_b
                     c["ast"] += g["assists"] or 0.0
                 gi += 1
             # rim/mid apportionment of banked fg2 by point-share proxy at this snap
@@ -178,7 +282,13 @@ def build_season(conn, season, pulled_at):
             c["fg2m_rim"] = c["fg2m"] * frac_rim
             c["fg2a_mid"] = c["fg2a"] * (1 - frac_rim)
             c["fg2m_mid"] = c["fg2m"] * (1 - frac_rim)
-            c["potential_ast_asof"] = potast.get(pid, {}).get(snap, 0.0)
+            _raw_now = potast.get(pid, {}).get(snap, 0.0)
+            _win_min = c["min_asof"] - _prev_min_at_potast
+            _win_cnt = _raw_now - _prev_potast_raw
+            f_p = _winsor_factor(_win_cnt, _win_min, ref_p, K_POTAST, c["gp_played_asof"], MIN_GAMES)
+            c["potential_ast_asof"] += _win_cnt * f_p
+            _prev_potast_raw = _raw_now
+            _prev_min_at_potast = c["min_asof"]
             if c["gp_played_asof"] > 0:
                 row = {"nba_api_id": pid, "season": season, "snapshot_date": snap,
                        "pulled_at": pulled_at}

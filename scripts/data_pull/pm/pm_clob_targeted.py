@@ -41,6 +41,8 @@ from scripts.data_pull.pm.pm_clob import _fetch_history_one, _history_rows
 
 DB_PATH = Path("data/awards.db")
 
+_STAT_LEADER_AWARDS = {"PTS_LEADER", "REB_LEADER", "AST_LEADER", "BLK_LEADER", "STL_LEADER"}
+
 FAMILY_PATTERNS: dict[str, str] = {
     "scoring_leader": r"scoring (title|champion|leader)|most points|"
                       r"lead(s|er)?.{0,15}\bin scoring\b|lead(s|er)?.{0,12}\bpoints\b|top scorer|ppg leader",
@@ -85,7 +87,7 @@ def _select_targets(rows, families, seasons, contexts, yes_only):
     selected, tally = [], {f: 0 for f in families}
     seen_family = {}
     for r in rows:
-        if r["award"] != "OTHER":
+        if r["award"] != "OTHER" and r["award"] not in _STAT_LEADER_AWARDS:
             continue
         if seasons and r["season"] not in seasons:
             continue

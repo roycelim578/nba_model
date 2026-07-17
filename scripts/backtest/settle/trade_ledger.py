@@ -91,6 +91,8 @@ class TradeLedger:
         self.position_log = []
         self._equity_dates = []
         self._equity = []
+        self._deployed_dates = []
+        self._deployed = []
 
     def _name(self, pid):
         return self.names.get(int(pid), str(int(pid)))
@@ -174,6 +176,14 @@ class TradeLedger:
         self._equity_dates.append(str(date))
         self._equity.append(float(eq))
 
+    def record_deployed(self, date, deployed_usd):
+        """Daily sizer target notional (sum of |target_usd| across candidates),
+        recorded whether or not a trade actually fired that day, so idle days
+        pull the average down exactly as they should for a capital-utilisation
+        read."""
+        self._deployed_dates.append(str(date))
+        self._deployed.append(float(deployed_usd))
+
     def force_close(self, date, player_id, exit_eff_price, exit_mid_leg, reason="EXIT"):
         """Fully liquidate before resolution. Routes through the sell path so close
         attribution and cash both update."""
@@ -201,6 +211,7 @@ class TradeLedger:
                 p, is_settle=True, settle_leg=settle_leg, close_date=str(date),
                 reason="SETTLE", settle_yes_report=settle_yes))
             del self._pos[pid]
+        self.record_mark(date, {})
 
     def _attribute(self, p, is_settle, settle_leg, close_date, reason, settle_yes_report):
         tb = p.total_bought
@@ -284,18 +295,16 @@ class TradeLedger:
                    n_positions_closed=len(self.position_log),
                    n_transactions=len(self.trade_log))
         if len(eq) >= 3:
-            rets = np.diff(eq) / eq[:-1]
-            rets = rets[np.isfinite(rets)]
-            mu = rets.mean()
-            sd = rets.std(ddof=1) if rets.size > 1 else float("nan")
-            downside = rets[rets < 0]
-            dsd = downside.std(ddof=1) if downside.size > 1 else float("nan")
-            peak = np.maximum.accumulate(eq)
-            dd = (eq - peak) / peak
-            out.update(sharpe_per_step=float(mu / sd) if sd and np.isfinite(sd) and sd > 0 else float("nan"),
-                       sortino_per_step=float(mu / dsd) if dsd and np.isfinite(dsd) and dsd > 0 else float("nan"),
-                       max_drawdown_pct=float(100.0 * dd.min()),
+            from scripts.common import risk_metrics as _risk
+            out.update(sharpe=_risk.sharpe(eq),
+                       sortino=_risk.sortino(eq),
+                       max_drawdown_pct=float(100.0 * _risk.max_drawdown(eq)),
                        n_marks=int(eq.size))
+        if self._deployed:
+            avg_deployed = float(np.mean(self._deployed))
+            out["avg_deployed_usd"] = avg_deployed
+            out["return_on_deployed_pct"] = (100.0 * realised_total / avg_deployed
+                                             if avg_deployed > 1e-9 else float("nan"))
         pl = self.position_log
         if pl:
             for k in ("fair_value_edge", "outcome_surprise", "cost_drag", "path_residual"):
@@ -309,4 +318,7 @@ class TradeLedger:
             recon = sum(out.get("sum_" + k, 0) for k in
                         ("fair_value_edge", "outcome_surprise", "cost_drag", "path_residual"))
             out["attribution_reconciles"] = bool(abs(recon - realised_total) < 0.5)
+            sfve = out.get("sum_fair_value_edge", 0.0)
+            out["edge_realisation_ratio"] = (realised_total / sfve
+                                             if abs(sfve) > 1e-9 else float("nan"))
         return out

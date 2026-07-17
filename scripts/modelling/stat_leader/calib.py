@@ -80,6 +80,71 @@ def renorm_snapshot(pcal):
     return pcal / s if s > 0 else pcal
 
 
+def beta_fit_cov(p, y, f, ridge=1e-3, iters=50):
+    """As beta_fit, and additionally the coefficient covariance inv(H) at the
+    optimum. H = X^T W X + ridge*I is the ridged log-loss Hessian, W the diagonal
+    of Bernoulli variances mu*(1-mu); its inverse is the coefficient uncertainty
+    the P(lead) pool is drawn from. The IRLS loop is a deliberate copy of beta_fit
+    (kept separate so beta_fit stays byte-frozen), and the seam test asserts the
+    returned w equals beta_fit exactly for identical inputs. Returns (w, cov) with
+    cov symmetrised."""
+    X = _design(p, f)
+    y = np.asarray(y, float)
+    w = np.zeros(X.shape[1])
+    R = ridge * np.eye(X.shape[1])
+    for _ in range(iters):
+        eta = np.clip(X @ w, -30, 30)
+        mu = 1.0 / (1.0 + np.exp(-eta))
+        s = np.clip(mu * (1 - mu), 1e-6, None)
+        grad = X.T @ (mu - y) + ridge * w
+        H = X.T @ (X * s[:, None]) + R
+        try:
+            step = np.linalg.solve(H, grad)
+        except np.linalg.LinAlgError:
+            break
+        w_new = w - step
+        if not np.all(np.isfinite(w_new)):
+            break
+        if np.max(np.abs(w_new - w)) < 1e-8:
+            w = w_new
+            break
+        w = w_new
+    eta = np.clip(X @ w, -30, 30)
+    mu = 1.0 / (1.0 + np.exp(-eta))
+    s = np.clip(mu * (1 - mu), 1e-6, None)
+    H = X.T @ (X * s[:, None]) + R
+    try:
+        cov = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(H)
+    cov = 0.5 * (cov + cov.T)
+    return w, cov
+
+
+def plead_pool(p, f, w, cov, n_draws=4000, seed=0, jitter=1e-9):
+    """Joint calibrated-P(lead) draw for one snapshot, the outcome-variance channel
+    the sizer's CVaR leg consumes (the MC analogue of forward_edge.per_draw_pwin).
+    One coefficient vector per draw from N(w, cov), the Beta map applied across the
+    WHOLE snapshot per draw, renormalised within the snapshot per draw, so
+    cross-candidate exclusivity and coupling are preserved (a row is one joint
+    draw). Returns an [n_draws, n_cand] array; column i is candidate i's [n_draws]
+    pool. The column mean approximates the point calibrated P(lead); renormalisation
+    is nonlinear so it is close not exact, and the seam test reports the max abs
+    diff."""
+    p = np.asarray(p, float)
+    f = np.asarray(f, float)
+    rng = np.random.default_rng(seed)
+    cov_j = np.asarray(cov, float) + jitter * np.eye(np.asarray(cov, float).shape[0])
+    coeff = rng.multivariate_normal(np.asarray(w, float), cov_j, size=int(n_draws),
+                                    method="cholesky")
+    D = _design(p, f)
+    eta = np.clip(D @ coeff.T, -30, 30)
+    pc = 1.0 / (1.0 + np.exp(-eta))
+    col = pc.sum(axis=0, keepdims=True)
+    pc = np.where(col > 0, pc / col, pc)
+    return pc.T
+
+
 # --------------------------------------------------------------------------- #
 # Locked walk-forward driver
 # --------------------------------------------------------------------------- #

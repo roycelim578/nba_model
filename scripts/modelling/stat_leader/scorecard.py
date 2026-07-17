@@ -18,6 +18,12 @@ Run:
 
 from __future__ import annotations
 
+import os
+
+for _blas_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                  "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_blas_var] = "1"
+
 import argparse
 import logging
 import math
@@ -40,7 +46,7 @@ except ImportError:  # pragma: no cover
 log = logging.getLogger("stat_leader.scorecard")
 
 REL_EDGES = (0.0, 0.02, 0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 1.0)
-STAT_FLOOR = {"pts": 1997, "reb": 1997, "ast": 2013}
+STAT_FLOOR = {"pts": 1997, "reb": 1997, "ast": 2013, "stl": 1997, "blk": 1997}
 PHASES = ("early", "mid", "late")
 EPS = 1e-9
 
@@ -176,11 +182,53 @@ def phase_bin_report(stat, rows):
         print(f"    {f'{lo:.2f}-{hi:.2f}':>11} | {cells[0]:>22} | {cells[1]:>22} | {cells[2]:>22}")
 
 
+def _season_worker(task):
+    """Independent per-season unit for the process pool. Opens a private read-only
+    connection, sets the MC globals for this run, fits priors on the season's own
+    rolling window and collects the scorecard rows. Returns picklable primitives
+    only (never the big B dict). Deterministic: the MC seeds per (season, stat,
+    snap) via zlib.crc32, so pooling in season order reproduces the serial result
+    bit for bit. Each worker process is isolated, so the MC module globals cannot
+    leak across seasons the way they could in a shared serial loop."""
+    (db, season, stats, k, field_n, fit_lookback,
+     no_shrink, own_prior, avail_hier) = task
+    try:
+        from scripts.common.config import assert_not_sealed
+    except ImportError:
+        from config import assert_not_sealed  # type: ignore
+    empty = {st: [] for st in stats}
+    active = [st for st in stats if season >= STAT_FLOOR[st]]
+    if not active:
+        return season, empty, {}, {}
+    for st in active:
+        assert_not_sealed(MC.STAT_AWARD[st], season)
+    conn = connect(db)
+    MC.AVAIL_HIER = bool(avail_hier)
+    try:
+        B = MC.load_all(conn, season, fit_lookback)
+    except Exception as e:
+        conn.close()
+        log.warning("season %d skipped (%s)", season, e)
+        return season, empty, {}, {}
+    MC.MPG_K = None if no_shrink else B["mpg_k"]
+    MC.GAMES_K = None if no_shrink else B["games_k"]
+    MC.OWN_PRIOR_K = MC.V.REF_MIN if own_prior else None
+    rows = {st: [] for st in stats}
+    kv = {}
+    kgv = {}
+    for st in active:
+        kv[st] = B["mpg_k"]
+        kgv[st] = B["games_k"]
+        rows[st] = collect(B, season, st, k, field_n)
+    conn.close()
+    return season, rows, kv, kgv
+
+
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     p = argparse.ArgumentParser(description="Stat-leader P(lead) scorecard v5 (measured minutes shrink).")
     p.add_argument("--db", default="data/awards.db")
-    p.add_argument("--stat", default="all", choices=["reb", "pts", "ast", "all"])
+    p.add_argument("--stat", default="all", choices=["reb", "pts", "ast", "stl", "blk", "all"])
     p.add_argument("--eval-min", type=int, default=2008)
     p.add_argument("--eval-max", type=int, default=2023)
     p.add_argument("--fit-lookback", type=int, default=10)
@@ -190,9 +238,11 @@ def main(argv=None):
     p.add_argument("--own-prior", action="store_true", help="blend the rate prior mean toward the player's prior-season rate")
     p.add_argument("--avail-hier", action="store_true", help="hierarchical availability recentre (own history for the centre)")
     p.add_argument("--beta", action="store_true", help="apply the walk-forward Beta calibration to P(lead) before scoring")
+    p.add_argument("--workers", type=int, default=6, help="process-pool workers over seasons (<=1 or --serial runs in-process)")
+    p.add_argument("--serial", action="store_true", help="run seasons in-process; the parallel-refactor no-op gate")
     args = p.parse_args(argv)
 
-    stats = ["reb", "pts", "ast"] if args.stat == "all" else [args.stat]
+    stats = ["reb", "pts", "ast", "stl", "blk"] if args.stat == "all" else [args.stat]
     try:
         from scripts.common.config import assert_not_sealed
     except ImportError:
@@ -204,26 +254,23 @@ def main(argv=None):
 
     pooled = {st: [] for st in stats}
     kvals = defaultdict(list); kgvals = defaultdict(list)
-    conn = connect(args.db)
-    for s in seasons:
-        active = [st for st in stats if s >= STAT_FLOOR[st]]
-        if not active:
-            continue
-        MC.AVAIL_HIER = bool(args.avail_hier)
-        try:
-            B = MC.load_all(conn, s, args.fit_lookback)
-        except Exception as e:
-            log.warning("season %d skipped (%s)", s, e); continue
-        MC.MPG_K = None if args.no_shrink else B["mpg_k"]
-        MC.GAMES_K = None if args.no_shrink else B["games_k"]
-        MC.OWN_PRIOR_K = MC.V.REF_MIN if args.own_prior else None
-        log.info("season %d: fit rolling %d-%d, minutesK=%.0f gamesKg=%.0f own_prior=%s%s", s,
-                 s - args.fit_lookback, s - 1, B["mpg_k"], B["games_k"],
-                 bool(args.own_prior), " (SHRINK OFF)" if args.no_shrink else "")
-        for st in active:
-            kvals[st].append(B["mpg_k"]); kgvals[st].append(B["games_k"])
-            pooled[st].extend(collect(B, s, st, args.k, args.field_n))
-    conn.close()
+    tasks = [(args.db, s, stats, args.k, args.field_n, args.fit_lookback,
+              bool(args.no_shrink), bool(args.own_prior), bool(args.avail_hier))
+             for s in seasons]
+    if args.serial or args.workers <= 1:
+        results = [_season_worker(t) for t in tasks]
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+            results = list(ex.map(_season_worker, tasks))
+    for season, rows, kv, kgv in results:
+        for st in stats:
+            pooled[st].extend(rows.get(st, []))
+        for st in kv:
+            kvals[st].append(kv[st]); kgvals[st].append(kgv[st])
+        if kv:
+            log.info("season %d done (minutesK=%.0f gamesKg=%.0f)",
+                     season, next(iter(kv.values())), next(iter(kgv.values())))
     MC.MPG_K = None; MC.GAMES_K = None; MC.OWN_PRIOR_K = None; MC.AVAIL_HIER = False
 
     if args.beta:

@@ -20,6 +20,11 @@ DPOY = "DPOY"
 ROTY = "ROTY"
 CHAMPIONSHIP = "CHAMPIONSHIP"
 OTHER = "OTHER"
+PTS_LEADER = "PTS_LEADER"
+REB_LEADER = "REB_LEADER"
+AST_LEADER = "AST_LEADER"
+BLK_LEADER = "BLK_LEADER"
+STL_LEADER = "STL_LEADER"
 
 # Ordered rules: first match wins. Order matters because some titles contain
 # multiple award-ish tokens (e.g. "Defensive Player" also contains "Player").
@@ -45,11 +50,22 @@ _RULES: list[tuple[re.Pattern, str]] = [
         r"to\s+win\s+the\s+(?:nba\s+)?title|\bnba\s+championship\b|"
         r"\bchampions?\b"
     ), CHAMPIONSHIP),
+    (re.compile(r"lead\s+(?:the\s+)?(?:nba\s+|league\s+)?in\s+(?:scoring|points|ppg)|scoring\s+(?:title|leader)"), PTS_LEADER),
+    (re.compile(r"lead\s+(?:the\s+)?(?:nba\s+|league\s+)?in\s+(?:rebounds?|rebounding|rpg)|rebound(?:s|ing)?\s+(?:title|leader)"), REB_LEADER),
+    (re.compile(r"lead\s+(?:the\s+)?(?:nba\s+|league\s+)?in\s+(?:assists?|apg)|assists?\s+(?:title|leader)"), AST_LEADER),
+    (re.compile(r"lead\s+(?:the\s+)?(?:nba\s+|league\s+)?in\s+(?:blocks?|bpg)|blocks?\s+(?:title|leader)"), BLK_LEADER),
+    (re.compile(r"lead\s+(?:the\s+)?(?:nba\s+|league\s+)?in\s+(?:steals?|spg)|steals?\s+(?:title|leader)"), STL_LEADER),
 ]
 
 # "finals mvp" should NOT classify as MVP (out of scope, conditional on finals).
 # It is left as OTHER deliberately. This pattern is used to short-circuit.
 _FINALS_MVP = re.compile(r"finals\s+mvp|finals\s+most\s+valuable")
+
+_STAT_LEADER_SET = {PTS_LEADER, REB_LEADER, AST_LEADER, BLK_LEADER, STL_LEADER}
+_STAT_NONSEASON = re.compile(
+    r"\bfinals?\b|conference\s+finals|\bplayoffs?\b|\bgame[ -]?\d|\bg\d\b|"
+    r"\bseries\b|\btonight\b|\btoday\b"
+)
 
 
 def _normalise(*parts: str | None) -> str:
@@ -76,6 +92,8 @@ def classify_award(title: str | None, slug: str | None = None) -> tuple[str, str
 
     for pattern, award in _RULES:
         if pattern.search(raw):
+            if award in _STAT_LEADER_SET and _STAT_NONSEASON.search(raw):
+                return OTHER, raw
             return award, raw
 
     return OTHER, raw

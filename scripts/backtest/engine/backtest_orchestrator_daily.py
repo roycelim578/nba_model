@@ -36,6 +36,7 @@ from concurrent.futures import ProcessPoolExecutor as _PPE
 from scripts.backtest.engine import backtest_orchestrator as bo
 from scripts.backtest.engine.backtest_pricejoin_daily import load_daily_grid
 from scripts.strategy.trade_regions import region_adapter as _region
+from scripts.backtest.registry import AwardSpec, EXPLICIT_MASK, get_spec, load_vol_model
 
 
 def _interp_frac(snap_frac_pairs, day):
@@ -60,11 +61,13 @@ class AwardDailyCtx:
     pass
 
 
-def prepare_award_daily(conn, award, season, budget, ceiling=bo.KELLY_FILL_CEILING,
+def prepare_award_daily(conn, award_or_spec, season, budget, ceiling=bo.KELLY_FILL_CEILING,
                     use_stub=False, verbose=True, turnover=None, n_restarts=6,
                     warn_spread=False, budget_asof=None):
     from scripts.common import config as _cfg
-    _cfg.assert_not_sealed(award, season)
+    spec = award_or_spec if isinstance(award_or_spec, AwardSpec) else get_spec(award_or_spec)
+    award = spec.name
+    _cfg.assert_not_sealed(spec.seal_key, season)
     from scripts.strategy.forward_estimates import forward_edge as fe
     from scripts.strategy.sizing import sizer_fill
     from scripts.strategy.sizing.sizer import rank_floor_mask
@@ -73,11 +76,11 @@ def prepare_award_daily(conn, award, season, budget, ceiling=bo.KELLY_FILL_CEILI
     from scripts.backtest.settle.trade_ledger import TradeLedger
     from scripts.strategy.cost.cost_model import CostModel
 
-    feature_snaps, daily = load_daily_grid(conn, award, season)
+    feature_snaps, daily = spec.pricejoin_fn(conn, award, season)
     if not daily:
         raise RuntimeError(f"no daily grid for {award} {season}")
-    samples_by_snap = bo.A_build_samples(conn, award, season, feature_snaps)
-    vol_model = bo.A_vol_model()
+    samples_by_snap = spec.samples_fn(conn, award, season, feature_snaps)
+    vol_model = load_vol_model(spec.vol_pkl)
 
     base_vsp = {s: np.asarray(v.vote_share_pred, float).copy() for s, v in samples_by_snap.items()}
     base_sw = {s: np.asarray(v.sizing_weights, float).copy() for s, v in samples_by_snap.items()}
@@ -108,6 +111,12 @@ def prepare_award_daily(conn, award, season, budget, ceiling=bo.KELLY_FILL_CEILI
     ctx = AwardDailyCtx()
     ctx.ScaleParams = ScaleParams
     ctx.award = award
+    ctx.spec = spec
+    ctx.fatigue_reweight = spec.fatigue_reweight
+    ctx.guard_top_k = spec.guard_top_k
+    ctx.jsfloor = spec.jsfloor
+    ctx.pwin_kind = spec.pwin_kind
+    ctx.rank_floor = spec.rank_floor
     ctx.base_sw = base_sw
     ctx.base_vsp = base_vsp
     ctx.candidates = candidates
@@ -139,6 +148,23 @@ def prepare_award_daily(conn, award, season, budget, ceiling=bo.KELLY_FILL_CEILI
     ctx.award_budget_default = float(budget)
     ctx.region_state = _region_state
     return ctx
+
+
+def _pwin_source(ctx, samples):
+    """Per-candidate pwin draw source selected by AwardSpec.pwin_kind. "cloud"
+    returns the eta-widened score cloud consumed by forward_edge exactly as the
+    voter arm does. "pool" is the stat path: the per-candidate draw pool lives on
+    the samples object (samples.pool, [n_draws, n_cand]) and is read directly by
+    _composite through forward_edge's pw_pool argument, so the cloud is unused on
+    this path and this returns None. Every cloud-consuming step in _award_core (eta
+    widening, the renorm_set market-floor blend, the eligibility reweight) is guarded
+    off on the pool path so fair value stays the calibrated full-field P(lead)."""
+    kind = ctx.pwin_kind
+    if kind == "cloud":
+        return bo._cloud(samples)
+    if kind == "pool":
+        return None
+    raise ValueError(f"unknown pwin_kind {kind!r}")
 
 
 def _award_core(ctx, day, budget, region_state, record):
@@ -175,10 +201,10 @@ def _award_core(ctx, day, budget, region_state, record):
     pids = [int(p) for p in samples.player_ids]
     frac = snap_frac[str(day)]
     yes_mids = {int(pid): float(y) for pid, y in yes_prices.items()}
-    cloud = bo._cloud(samples)
+    cloud = _pwin_source(ctx, samples)
 
     _fat_detail = []
-    if bo.FATIGUE_REWEIGHT.get(award, False):
+    if ctx.fatigue_reweight:
         from scripts.strategy.pricing import fatigue_reweight
         _fat, _fat_detail = fatigue_reweight.apply_fatigue(
             samples.vote_share_pred, pids, conn, award, season, snap=carried,
@@ -191,27 +217,35 @@ def _award_core(ctx, day, budget, region_state, record):
             if m is not None:
                 hist_logit[pid].append(float(bo._logit(m)))
     _stage_raw = list(map(float, samples.vote_share_pred))
-    _pe = bo._elig_factors(conn, bo._ELIG_DIST, award, season, day, pids)
+    _pe = {} if ctx.pwin_kind == "pool" else bo._elig_factors(conn, bo._ELIG_DIST, award, season, day, pids)
     _stage_prefatigue = _stage_raw
     _stage_postfatigue = list(map(float, samples.vote_share_pred))
-    samples.vote_share_pred[:] = bo._elig_reweight(samples.vote_share_pred, pids, _pe)
+    if ctx.pwin_kind != "pool":
+        samples.vote_share_pred[:] = bo._elig_reweight(samples.vote_share_pred, pids, _pe)
     _stage_postelig = list(map(float, samples.vote_share_pred))
     _fat_mult_map = ({int(d["player_id"]): float(d["mult"]) for d in _fat_detail}
-                     if bo.FATIGUE_REWEIGHT.get(award, False) else {})
+                     if ctx.fatigue_reweight else {})
     _rw = np.array([float(_pe.get(int(pids[i]), 1.0)) * _fat_mult_map.get(int(pids[i]), 1.0)
                     for i in range(len(pids))], dtype=float)
     _logrw = np.where(_rw > 0, np.log(np.clip(_rw, 1e-300, None)), -np.inf)
-    cloud = np.asarray(cloud, dtype=float) + _logrw[:, None]
-    samples.sizing_weights[:] = bo._elig_reweight(samples.sizing_weights, pids, _pe)
-    rf_mask = rank_floor_mask(samples.vote_share_pred, award)
+    if ctx.pwin_kind != "pool":
+        cloud = np.asarray(cloud, dtype=float) + _logrw[:, None]
+    if ctx.pwin_kind != "pool":
+        samples.sizing_weights[:] = bo._elig_reweight(samples.sizing_weights, pids, _pe)
+    if ctx.rank_floor is EXPLICIT_MASK:
+        rf_mask = np.asarray(samples.tradeable_mask, dtype=bool)
+    else:
+        _rf_v = np.asarray(samples.vote_share_pred, dtype=float)
+        rf_mask = np.zeros(_rf_v.size, dtype=bool)
+        rf_mask[np.argsort(-_rf_v)[:ctx.rank_floor]] = True
     tradeable_now = np.array([pids[i] in yes_mids for i in range(len(pids))], dtype=bool)
     alloc_mask = rf_mask & tradeable_now
-    if bo.RENORM_MODE != "baseline":
+    if bo.RENORM_MODE != "baseline" and ctx.pwin_kind != "pool":
         from scripts.strategy.pricing import renorm_set
         from scripts.strategy.pricing import fp_point_loader
         _yesmap = {pids[i]: yes_mids.get(pids[i]) for i in range(len(pids))}
         _fp_vec = (fp_point_loader.fp_vector(conn, award, season, carried, pids)
-                   if (bo.RENORM_MODE == "union_jspeak" and award in bo.JSFLOOR_AWARDS) else None)
+                   if (bo.RENORM_MODE == "union_jspeak" and ctx.jsfloor) else None)
         if _fp_vec is not None:
             _fpm = np.isfinite(_fp_vec)
             _fp_vec[_fpm] = _fp_vec[_fpm] * _rw[_fpm]
@@ -258,7 +292,7 @@ def _award_core(ctx, day, budget, region_state, record):
                          central_weights=bo.CENTRAL_WEIGHTS, a_prev=a_prev,
                          turnover_default=(bo.TURNOVER_DEFAULT if turnover is None else turnover),
                          n_restarts=n_restarts,
-                         guard_top_k=bo.GUARD_TOP_K.get(award, 0))
+                         guard_top_k=ctx.guard_top_k)
     raw = np.asarray(res.raw_allocation, float)
     if record and warn_spread and res.restart_spread > 0.02 and verbose:
         print(f"  [{day}] WARN sizer restart_spread={res.restart_spread:.3f} (non-convexity)")
@@ -280,9 +314,10 @@ def _award_core(ctx, day, budget, region_state, record):
         size_intended = abs(raw[i])
         entry_cost = candidates[pid].cost_curve(day, side).cost_frac_at(size_intended)
         hist = np.diff(np.asarray(hist_logit[pid], float)) if len(hist_logit[pid]) > 1 else np.zeros(1)
+        _pw_pool = samples.pool[:, i] if ctx.pwin_kind == "pool" else None
         radj, eedge, cvar, psig = bo._composite(
             fe, cloud, i, leg_price, entry_cost, vol_model, frac, hist, side,
-            central_pwin=float(samples.vote_share_pred[i]))
+            central_pwin=float(samples.vote_share_pred[i]), pw_pool=_pw_pool)
         radj_list.append(radj); psig_list.append(psig); kelly_targets.append(raw[i])
         diag_rows.append(dict(pid=pid, side=side, radj=radj))
         _edge_by_pid[pid] = (float(eedge), float(cvar))
@@ -343,6 +378,7 @@ def step_award_day(ctx, day):
     yes_mids = out["yes_mids"]
     if out["empty"]:
         bo.self_mark(ledger, day, yes_mids, samples)
+        ledger.record_deployed(day, out["deployed"])
         ctx.region_state = out["region_state"]
         return
     names = ctx.names
@@ -368,6 +404,7 @@ def step_award_day(ctx, day):
                          fv_yes=fv, name=names.get(pid), verbose=verbose)
 
     bo.self_mark(ledger, day, yes_mids, samples)
+    ledger.record_deployed(day, out["deployed"])
     ctx.region_state = out["region_state"]
 
 
@@ -380,7 +417,11 @@ def finalize_award_daily(ctx):
     model_eval = ctx.model_eval
     season = ctx.season
     verbose = ctx.verbose
-    winner = bo.A_true_winner(conn, award, season)
+    if ctx.pwin_kind == "pool":
+        from scripts.backtest.stat_leader.stat_producers import stat_true_leader
+        winner = stat_true_leader(conn, award, season)
+    else:
+        winner = bo.A_true_winner(conn, award, season)
     _n_before = len(ledger.position_log)
     ledger.settle(last_day, winner_player_id=winner)
     if verbose:

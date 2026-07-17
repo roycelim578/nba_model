@@ -1,0 +1,49 @@
+# Nickname / alias seed for identity resolution.
+#
+# WHY THIS IS A FILE, NOT AN IN-CODE DICT:
+#   - editable without touching resolve_identity.py
+#   - Phase 3 news/reddit ingestion reuses the SAME aliases (those sources are
+#     far worse for nicknames than Polymarket), so the map must live outside any
+#     one module.
+#
+# SHAPE: alias (lowercased nickname/handle) -> canonical full name.
+#   The canonical name is then resolved through the normal normalise+match path,
+#   so this file never contains a player_id (ids are allocated at runtime and
+#   differ per DB). An alias is a hint about WHICH NAME a fragment means, not a
+#   direct id mapping.
+#
+# RULES:
+#   - Keys are matched after the same normalisation applied to any raw name
+#     (lowercase, strip diacritics/punctuation, collapse whitespace).
+#   - An alias hit means: treat the raw fragment as if it were the canonical
+#     name, then resolve that name normally. Confidence/method follow from how
+#     the canonical name itself resolves (so an alias to an exact-matchable name
+#     resolves at 1.0 via method='exact'; the alias use is recorded in notes).
+#   - ANY nickname NOT in this seed is unresolved-for-review, never guessed.
+#   - Extend freely; Royce owns the contents.
+
+# --- current-era stars commonly referred to by nickname/initials on PM -------
+"sga": "Shai Gilgeous-Alexander"
+"giannis": "Giannis Antetokounmpo"
+"the greek freak": "Giannis Antetokounmpo"
+"luka": "Luka Doncic"
+"the joker": "Nikola Jokic"
+"jokic": "Nikola Jokic"          # diacritic-free surname-only, common on PM
+"wemby": "Victor Wembanyama"
+"the alien": "Victor Wembanyama"
+"kat": "Karl-Anthony Towns"
+"pg13": "Paul George"
+"cp3": "Chris Paul"
+"the beard": "James Harden"
+"dame": "Damian Lillard"
+"ad": "Anthony Davis"
+"kd": "Kevin Durant"
+"steph": "Stephen Curry"
+"book": "Devin Booker"
+"jb": "Jaylen Brown"
+"jt": "Jayson Tatum"
+"the brow": "Anthony Davis"
+"spida": "Donovan Mitchell"
+"ja": "Ja Morant"
+"nicolas claxton": "Nic Claxton"
+

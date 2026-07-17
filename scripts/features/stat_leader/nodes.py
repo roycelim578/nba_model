@@ -56,6 +56,8 @@ BETA_NODES = {
     "fg2_mid": ("fg2m_mid", "fg2a_mid"),
     "ft": ("ftm", "fta"),
     "ast_conv": ("ast", "potential_ast_asof"),
+    "stl_conv": ("stl", "defl"),
+    "blk_conv": ("blk", "rim_fga"),
 }
 
 # Dirichlet composition nodes: name -> ordered list of count columns forming the
@@ -75,6 +77,37 @@ def _load(conn, seasons):
     counts = {}
     for r in conn.execute(f"SELECT * FROM stat_rate_counts_asof WHERE season IN ({qs})", seasons):
         counts[(r["season"], r["snapshot_date"], r["nba_api_id"])] = dict(r)
+    for _k in counts:
+        counts[_k]["defl"] = None
+        counts[_k]["rim_fga"] = None
+    for r in conn.execute(f"SELECT season, snapshot_date, nba_api_id, defl_std "
+                          f"FROM stg_nba_hustle_asof WHERE season IN ({qs})", seasons):
+        d = counts.get((r["season"], r["snapshot_date"], r["nba_api_id"]))
+        if d is not None and r["defl_std"] is not None and d.get("gp_played_asof"):
+            d["defl"] = r["defl_std"] * d["gp_played_asof"]
+    for r in conn.execute(f"SELECT season, snapshot_date, nba_api_id, def_rim_fga "
+                          f"FROM stg_nba_player_asof_ext WHERE season IN ({qs})", seasons):
+        d = counts.get((r["season"], r["snapshot_date"], r["nba_api_id"]))
+        if d is not None:
+            d["rim_fga"] = r["def_rim_fga"]
+    for _k in counts:
+        for _c in ("cont3_std", "dloose_std", "dfga_fg3_std", "dpct_overall_std", "pfd"):
+            counts[_k].setdefault(_c, None)
+    for r in conn.execute(f"SELECT season, snapshot_date, nba_api_id, cont3_std, dloose_std "
+                          f"FROM stg_nba_hustle_asof WHERE season IN ({qs})", seasons):
+        d = counts.get((r["season"], r["snapshot_date"], r["nba_api_id"]))
+        if d is not None:
+            d["cont3_std"] = r["cont3_std"]; d["dloose_std"] = r["dloose_std"]
+    for r in conn.execute(f"SELECT season, snapshot_date, nba_api_id, dfga_fg3_std, dpct_overall_std "
+                          f"FROM stg_nba_defend_asof WHERE season IN ({qs})", seasons):
+        d = counts.get((r["season"], r["snapshot_date"], r["nba_api_id"]))
+        if d is not None:
+            d["dfga_fg3_std"] = r["dfga_fg3_std"]; d["dpct_overall_std"] = r["dpct_overall_std"]
+    for r in conn.execute(f"SELECT season, snapshot_date, nba_api_id, pfd "
+                          f"FROM stg_nba_player_asof_ext WHERE season IN ({qs})", seasons):
+        d = counts.get((r["season"], r["snapshot_date"], r["nba_api_id"]))
+        if d is not None:
+            d["pfd"] = r["pfd"]
     # final-season rate per (season, pid): realised end-of-season, the calibration label
     finals = {}
     last_snap = {}
@@ -293,7 +326,7 @@ def beta_posterior(priors, node, cohort, banked_mk, banked_at):
     inv_c = 1.0 / priors.get("node_od", {}).get(node, 1.0)  # underdispersed => more effective data
     mk_eff = banked_mk * inv_c
     at_eff = banked_at * inv_c
-    return a0 + mk_eff, b0 + (at_eff - mk_eff)
+    return a0 + mk_eff, b0 + max(at_eff - mk_eff, 0.0)
 
 
 def calib(priors, counts, finals, pos, firstyr, eval_seasons):

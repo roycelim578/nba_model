@@ -90,6 +90,10 @@ VOLUME_NODES = {
     "usage": ["used_fga", "used_ft_trip", "used_tov"],
     "reb": ["reb"],
     "ast_create": ["potential_ast_asof"],
+    "stl": ["stl"],
+    "blk": ["blk"],
+    "defl": ["defl"],
+    "rim_fga": ["rim_fga"],
 }
 
 

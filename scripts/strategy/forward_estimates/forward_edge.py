@@ -91,10 +91,14 @@ def _to_future_price(moves, price):
 
 
 def _draw_future_and_pwin(cloud, cand_idx, current_price, vol_model, frac, history,
-                          half_life, n_max, n_draws, rng, coupling_rho, central_pwin=None):
+                          half_life, n_max, n_draws, rng, coupling_rho, central_pwin=None,
+                          pw_pool=None):
     weights = survival_weights(half_life, n_max)
     moves = _mixture_moves(vol_model, current_price, frac, history, weights, n_draws, rng)
-    pw_pool = per_draw_pwin(cloud, cand_idx)
+    if pw_pool is None:
+        pw_pool = per_draw_pwin(cloud, cand_idx)
+    else:
+        pw_pool = np.asarray(pw_pool, dtype=float)
     if central_pwin is not None:
         pw_pool = np.clip(pw_pool - pw_pool.mean() + float(central_pwin), 1e-4, 1 - 1e-4)
     n = moves.size
@@ -111,13 +115,13 @@ def _draw_future_and_pwin(cloud, cand_idx, current_price, vol_model, frac, histo
 
 def composite_edge_draws(cloud, cand_idx, current_price, entry_cost, vol_model, frac,
                          history, half_life=None, n_max=25, side="yes", n_draws=8000, rng=None,
-                         coupling_rho=0.0, central_pwin=None):
+                         coupling_rho=0.0, central_pwin=None, pw_pool=None):
     rng = np.random.default_rng() if rng is None else rng
     if half_life is None:
         half_life = convergence_half_life(frac)
     future_yes, pw = _draw_future_and_pwin(cloud, cand_idx, current_price, vol_model, frac,
                                            history, half_life, n_max, n_draws, rng, coupling_rho,
-                                           central_pwin=central_pwin)
+                                           central_pwin=central_pwin, pw_pool=pw_pool)
     if side == "yes":
         return pw - future_yes - entry_cost
     return (1.0 - pw) - (1.0 - future_yes) - entry_cost

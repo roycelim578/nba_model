@@ -27,6 +27,12 @@ OOF_SEASON_CAP = 2023
 # 3000 bankroll; DPOY 741 is 742 rounded down so the split sums to 3000.
 BOOK_WEIGHTS = {
     2025: {"MVP": 951, "DPOY": 741, "ROTY": 1308},
+    # Validation-only, NOT production. Flat 1000 per stat book for the 2024
+    # six-book integration run; the principled shrunk-BSS re-split is deferred
+    # until the 2024 run yields the stat books' realised skill. Do not ship.
+    2024: {"MVP": 951, "DPOY": 741, "ROTY": 1308,
+           "PTS": 1000, "REB": 1000, "AST": 1000,
+           "STL": 1000, "BLK": 1000},
 }
 
 # Held-out sealed seasons per award. A backtest or score that touches one of these for
@@ -39,6 +45,11 @@ SEAL_REGISTRY = {
     "DPOY": [],
     "ROTY": [],
     "6MOTY": [2024, 2025],
+    "PTS": [2025],
+    "REB": [2025],
+    "AST": [2025],
+    "STL": [2025],
+    "BLK": [2025],
 }
 _DEFAULT_SEAL = [2024, 2025]
 

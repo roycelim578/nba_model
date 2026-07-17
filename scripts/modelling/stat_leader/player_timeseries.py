@@ -40,8 +40,8 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger("stat_leader.player_timeseries")
 
-STAT_FLOOR = {"pts": 1997, "reb": 1997, "ast": 2013}
-LB_T = {"reb": 0.5, "pts": 1.5, "ast": 0.5}   # leaderboard softmax temperature per scorecard
+STAT_FLOOR = {"pts": 1997, "reb": 1997, "ast": 2013, "stl": 1997, "blk": 1997}
+LB_T = {"reb": 0.5, "pts": 1.5, "ast": 0.5, "stl": 0.5, "blk": 0.5}   # leaderboard softmax temperature per scorecard
 MAX_LINES = 10
 
 
@@ -163,14 +163,14 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     p = argparse.ArgumentParser(description="Per-player probability time-series.")
     p.add_argument("--db", default="data/awards.db")
-    p.add_argument("--stat", default="all", choices=["reb", "pts", "ast", "all"])
+    p.add_argument("--stat", default="all", choices=["reb", "pts", "ast", "stl", "blk", "all"])
     p.add_argument("--year-min", type=int, default=2014)
     p.add_argument("--year-max", type=int, default=2023)
     p.add_argument("--fit-lookback", type=int, default=10)
     p.add_argument("--k", type=int, default=1000)
     p.add_argument("--out", default="out/viz")
     args = p.parse_args(argv)
-    stats = ["reb", "pts", "ast"] if args.stat == "all" else [args.stat]
+    stats = ["reb", "pts", "ast", "stl", "blk"] if args.stat == "all" else [args.stat]
     os.makedirs(args.out, exist_ok=True)
 
     conn = connect(args.db)

@@ -45,7 +45,7 @@ from scipy.optimize import minimize
 from scripts.common.db import connect
 from scripts.strategy.forward_estimates.pm_corpus import (
     _abin, _assemble, _basis, _fband, _fit_glm, _fit_jump, _garch, _glm_vol,
-    _jump_vol, _load, _logit, _ptier, _ql, _sigmoid, _EPS,
+    _jump_vol, _load, _logit, _ptier, _ql, _sigmoid, _w_frac, _EPS,
 )
 
 DB_PATH = "data/awards.db"
@@ -69,9 +69,10 @@ def _tqdm(it, disable, **kw):
 # ------------------------------------------------------------------ fit step
 
 def fit_forward_vol(db_path=DB_PATH, out_path=OUT_PATH, eps=0.005, l2=1.0,
-                    hmax=HMAX, no_progress=False):
+                    hmax=HMAX, no_progress=False, loader=None, lowconf_cells=None,
+                    jump=True):
     """Train all cross-sectional artefacts on the FULL corpus and pickle them."""
-    conn = connect(db_path); S = _load(conn, eps); conn.close()
+    conn = connect(db_path); S = (loader or _load)(conn, eps); conn.close()
     if not S:
         raise SystemExit("no series in corpus")
     train = list(S.items())  # FULL corpus, no held-out event
@@ -80,6 +81,10 @@ def fit_forward_vol(db_path=DB_PATH, out_path=OUT_PATH, eps=0.005, l2=1.0,
     jp = _fit_jump(train, eps)
     if glm is None:
         raise SystemExit("GLM fit failed (insufficient data)")
+
+    def _asm(gv, jv, gav, frac, al, wf, wp):
+        return _assemble(gv, jv, gav, frac, al, wf, wp) if jump else \
+            _assemble_nojump(gv, gav, frac, wf)
 
     # fitted fade weights (minimise assembled QLIKE over training points)
     tpts = []
@@ -100,7 +105,7 @@ def fit_forward_vol(db_path=DB_PATH, out_path=OUT_PATH, eps=0.005, l2=1.0,
 
     def obj(x):
         wf_p = x[:2]; wp_p = x[2:]
-        return sum(_ql(rv, _assemble(gv, jv, gav, frac, al, wf_p, wp_p))
+        return sum(_ql(rv, _asm(gv, jv, gav, frac, al, wf_p, wp_p))
                    for rv, gv, jv, gav, frac, al in tpts) / max(len(tpts), 1)
     best = None
     for x0 in ([0.0, 2.0, 0.0, 1.0], [-1.0, 3.0, -1.0, 2.0]):
@@ -126,7 +131,7 @@ def fit_forward_vol(db_path=DB_PATH, out_path=OUT_PATH, eps=0.005, l2=1.0,
                     continue
                 rmove = max(abs(s["lo"][k] - s["lo"][t]) for k in range(t, t + Heff + 1))
                 gv = _glm_vol(glm, al, ttr, frac, H, 1.0 if pt > 0.5 else 0.0); jv = _jump_vol(jp, al, H); gav = _garch_vol_local(vpath, H)
-                fv = _assemble(gv, jv, gav, frac, al, wf_p, wp_p)
+                fv = _asm(gv, jv, gav, frac, al, wf_p, wp_p)
                 ratio = rmove / max(fv * math.sqrt(Heff), _EPS)
                 cov_ratios.setdefault((tier, fb, H), []).append(ratio); pooled.append(ratio)
     # store as arrays for pickling
@@ -157,12 +162,17 @@ def fit_forward_vol(db_path=DB_PATH, out_path=OUT_PATH, eps=0.005, l2=1.0,
         for k in emp[H]:
             emp[H][k] = np.asarray(emp[H][k])
 
+    lc = (LOWCONF_CELLS if lowconf_cells is None
+          else _derive_lowconf(cov_ratios, pooled) if lowconf_cells == "auto"
+          else {tuple(c) for c in lowconf_cells})
     artefacts = {
         "glm_beta": glm[0], "glm_resid": glm[1], "jump_params": jp,
         "wf_p": wf_p, "wp_p": wp_p, "cov_ratios": cov_ratios, "pooled": pooled,
         "emp": emp, "eps": eps, "bw_frac": BW_FRAC, "bw_z": BW_Z,
-        "lowconf_cells": sorted(LOWCONF_CELLS), "n_events": len({s["event"] for _, s in train}),
+        "lowconf_cells": sorted(lc), "n_events": len({s["event"] for _, s in train}),
     }
+    if not jump:
+        artefacts["jump_disabled"] = True
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         pickle.dump(artefacts, f)
@@ -172,6 +182,34 @@ def fit_forward_vol(db_path=DB_PATH, out_path=OUT_PATH, eps=0.005, l2=1.0,
 
 def _garch_vol_local(vpath, H):
     return math.sqrt(max(vpath[:H].mean(), _EPS)) if vpath is not None else None
+
+
+def _assemble_nojump(glm_v, garch_v, frac, wf_p):
+    """No-jump assembly: GLM fades to GARCH by frac; GLM fallback where GARCH
+    is unavailable. The jump term and its price-fade are dropped entirely."""
+    if garch_v is None:
+        return glm_v
+    wfrac = _w_frac(wf_p, frac)
+    return (1 - wfrac) * glm_v + wfrac * garch_v
+
+
+def _derive_lowconf(cov_ratios, pooled, thin_n=60, heavy_mult=1.35):
+    """Stat-derived low-confidence cells from the coverage surface. A (tier,
+    fb) cell is flagged if pooled across horizons it is thin (few samples) OR
+    heavy-tailed (its 95th-pct coverage ratio exceeds the pooled 95th by
+    heavy_mult, so the model under-covers there). Returns a set of (tier,fb)."""
+    agg = {}
+    for (tier, fb, _H), arr in cov_ratios.items():
+        agg.setdefault((tier, fb), []).extend(list(arr))
+    p95 = float(np.percentile(pooled, 95)) if len(pooled) else 1.0
+    out = set()
+    for cell, vals in agg.items():
+        v = np.asarray(vals)
+        thin = len(v) < thin_n
+        heavy = len(v) >= 10 and float(np.percentile(v, 95)) > heavy_mult * p95
+        if thin or heavy:
+            out.add(cell)
+    return out
 
 
 # ------------------------------------------------------------- predict step
@@ -212,6 +250,14 @@ class ForwardVolModel:
     def __init__(self, path=OUT_PATH):
         with open(path, "rb") as f:
             self.a = pickle.load(f)
+
+    def _fv(self, gv, jv, gav, frac, al):
+        """Assembled point vol honouring the pkl's jump_disabled flag; absent
+        flag (voter pkl) -> original jump assembly, so behaviour is unchanged."""
+        a = self.a
+        if a.get("jump_disabled", False):
+            return _assemble_nojump(gv, gav, frac, a["wf_p"])
+        return _assemble(gv, jv, gav, frac, al, a["wf_p"], a["wp_p"])
 
     # --- coverage-surface edge with thin-cell shrinkage (kept for point_vol scale)
     def _edge(self, tier, fb, H, cover):
@@ -272,7 +318,7 @@ class ForwardVolModel:
         jv = _jump_vol(a["jump_params"], al, N)
         vpath = _garch(np.asarray(list(history), dtype=float), HMAX)
         gav = _garch_vol_local(vpath, N)
-        fv = _assemble(gv, jv, gav, frac_elapsed, al, a["wf_p"], a["wp_p"])
+        fv = self._fv(gv, jv, gav, frac_elapsed, al)
         model_sd = fv * math.sqrt(max(Heff, 1))
 
         if d is None or len(d["net"]) < 5:
@@ -331,7 +377,7 @@ class ForwardVolModel:
         hist = np.asarray(list(history), dtype=float)
         vpath = _garch(hist, HMAX)
         gav = _garch_vol_local(vpath, N)
-        fv = _assemble(gv, jv, gav, frac_elapsed, al, a["wf_p"], a["wp_p"])
+        fv = self._fv(gv, jv, gav, frac_elapsed, al)
 
         # signed alpha-quantiles from the empirical distribution at this price
         dn, en_d = self._signed_quantile(frac_elapsed, z, Hgrid, "down", alpha)

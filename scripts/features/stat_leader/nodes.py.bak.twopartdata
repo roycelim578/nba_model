@@ -1,0 +1,414 @@
+"""Stat-leader arm: rate nodes with hierarchical empirical-Bayes priors.
+
+Fits, on training seasons only, the conjugate priors for every rate node and
+exposes a posterior(player, snapshot) the Monte Carlo samples. Nodes:
+
+  Beta rates:      fg3 (fg3m/fg3a), fg2 (fg2m/fg2a), fg2_rim, fg2_mid, ft (ftm/fta),
+                   oreb-per-min, dreb-per-min (via reb split proxy), ast_conversion.
+  Dirichlet:       allocation (used_fga : used_ft_trip : used_tov).
+  (shot-mix 3PA:2PA handled as a Beta on fg3a/(fg3a+fg2a).)
+
+HIERARCHICAL PRIOR (empirical Bayes, precision-weighted, fit on training pool):
+  level 0 league  -> level 1 cohort (position x tenure x mpg-tier) -> player.
+  Each Beta prior is (m*kappa, (1-m)*kappa) where m is the shrunk cohort mean and
+  kappa the fitted concentration (pseudo-count strength). A player's posterior is
+  prior + banked counts, so high-history players self-dominate and thin-history
+  players fall back to cohort then league. Concentration kappa is fit by matching
+  the cross-sectional spread of realised rates (method of moments): tighter
+  empirical spread => larger kappa => stronger shrinkage.
+
+Cohort dims: position (guard/wing/big from player_position_map), tenure
+(season - first-game-log-season: 0-2 / 3-9 / 10+), mpg tier (within-season
+tercile). 27 cells, min-count backoff to position x tenure, then league.
+
+Reads stat_rate_counts_asof (substrate), stat_team_fg_asof (AST conversion prior
+target), player_position_map, stg_nba_player_game_logs (tenure). Walk-forward:
+priors fit on seasons < eval; never touches held-out seasons.
+
+Run (calibration report):
+  uv run python -m scripts.features.stat_leader.nodes --fit-max 2021 --eval-min 2022 --eval-max 2023
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from collections import defaultdict
+
+import numpy as np
+
+try:
+    from scripts.common.db import connect
+except ImportError:  # pragma: no cover
+    from db import connect  # type: ignore
+
+log = logging.getLogger("stat_leader.nodes")
+
+MIN_MPG = 15.0
+MIN_COHORT = 30
+
+# Beta nodes: name -> (makes_col, attempts_col)
+BETA_NODES = {
+    "fg3": ("fg3m", "fg3a"),
+    "fg2": ("fg2m", "fg2a"),
+    "fg2_rim": ("fg2m_rim", "fg2a_rim"),
+    "fg2_mid": ("fg2m_mid", "fg2a_mid"),
+    "ft": ("ftm", "fta"),
+    "ast_conv": ("ast", "potential_ast_asof"),
+}
+
+# Dirichlet composition nodes: name -> ordered list of count columns forming the
+# simplex. allocation splits USED possessions; shotmix splits FGA into 3/rim/mid.
+DIRICHLET_NODES = {
+    "alloc": ["used_fga", "used_ft_trip", "used_tov"],
+    "shotmix": ["fg3a", "fg2a_rim", "fg2a_mid"],
+}
+DIR_MIN_TRIALS = 50   # min banked simplex-total before a row enters the fit/eval
+
+def _tenure_bucket(t):
+    return 0 if t <= 2 else (1 if t <= 9 else 2)
+
+
+def _load(conn, seasons):
+    qs = ",".join("?" * len(seasons))
+    counts = {}
+    for r in conn.execute(f"SELECT * FROM stat_rate_counts_asof WHERE season IN ({qs})", seasons):
+        counts[(r["season"], r["snapshot_date"], r["nba_api_id"])] = dict(r)
+    # final-season rate per (season, pid): realised end-of-season, the calibration label
+    finals = {}
+    last_snap = {}
+    for (s, snap, pid), d in counts.items():
+        if (s, pid) not in last_snap or snap > last_snap[(s, pid)]:
+            last_snap[(s, pid)] = snap; finals[(s, pid)] = d
+    pos = {r["nba_api_id"]: r["position"] for r in conn.execute("SELECT nba_api_id, position FROM player_position_map")}
+    firstyr = {}
+    for r in conn.execute(f"SELECT nba_api_id, MIN(season) fy FROM stg_nba_player_game_logs GROUP BY nba_api_id"):
+        firstyr[r["nba_api_id"]] = r["fy"]
+    return counts, finals, pos, firstyr
+
+
+def _cohort(pid, season, d, pos, firstyr, mpg_cuts):
+    # cohort = position x mpg-tier. mpg IS the star proxy (high-mpg stars are
+    # stable and want little shrinkage; low-mpg bench pieces are noisy and want
+    # more), so it carries the tenure signal too; tenure dropped as redundant.
+    p = pos.get(pid, "wing") or "wing"
+    mpg = (d["min_asof"] / d["gp_played_asof"]) if d["gp_played_asof"] else 0.0
+    mt = 0 if mpg < mpg_cuts[0] else (1 if mpg < mpg_cuts[1] else 2)
+    return (p, mt)
+
+
+def _beta_rate(d, node):
+    mk, at = BETA_NODES[node]
+    return (d[mk] or 0.0), (d[at] or 0.0)
+
+
+def _measure_slope_od(counts, finals):
+    """Measure, on the TRAINING pool only, per-Beta-node banked->final slope
+    (=> kappa shrinkage) and trial overdispersion c (=> effective-sample scale).
+    Walk-forward honest: computed from the passed pool, never hardcoded."""
+    by = defaultdict(list)
+    for (s, snap, pid), d in counts.items():
+        by[(s, pid)].append((snap, d))
+    slope_pairs = defaultdict(lambda: ([], []))   # node -> (mid_rate, final_rate)
+    od_ratios = defaultdict(list)                 # node -> observed/binom var ratios
+    for (s, pid), snaps in by.items():
+        snaps.sort(key=lambda x: x[0])
+        fd = finals.get((s, pid))
+        if not fd or not fd["gp_played_asof"]: continue
+        if fd["min_asof"]/max(fd["gp_played_asof"],1) < MIN_MPG: continue
+        mids = [d for (snap, d) in snaps if d["gp_played_asof"] >= 25]
+        if not mids: continue
+        mid = mids[0]
+        for node in BETA_NODES:
+            mk_c, at_c = BETA_NODES[node]
+            a1, m1 = mid[at_c] or 0, mid[mk_c] or 0
+            af, mf = fd[at_c] or 0, fd[mk_c] or 0
+            if a1 >= 20 and af >= 40:
+                X, Y = slope_pairs[node]; X.append(m1/a1); Y.append(mf/af)
+            a2, m2 = af - a1, mf - m1
+            if a1 >= 30 and a2 >= 30:
+                p1, p2, pbar = m1/a1, m2/a2, (m1+m2)/(a1+a2)
+                bv = pbar*(1-pbar)*(1/a1+1/a2)
+                if bv > 0: od_ratios[node].append(((p1-p2)**2)/bv)
+    slope = {}; od = {}
+    for node in BETA_NODES:
+        X, Y = slope_pairs[node]
+        if len(X) >= 30:
+            X = np.array(X); Y = np.array(Y); A = np.c_[np.ones(len(X)), X]
+            b, *_ = np.linalg.lstsq(A, Y, rcond=None); slope[node] = float(b[1])
+        else:
+            slope[node] = 0.6
+        od[node] = float(np.median(od_ratios[node])) if od_ratios[node] else 1.0
+        od[node] = min(max(od[node], 0.3), 1.0)   # floor c: tiny c is small-sample noise
+    return slope, od
+
+
+def fit_priors(counts, finals, pos, firstyr):
+    # slope + overdispersion measured on THIS training pool (walk-forward honest)
+    NODE_SLOPE, NODE_OD = _measure_slope_od(counts, finals)
+    # mpg terciles from finals
+    mpgs = [(d["min_asof"]/d["gp_played_asof"]) for (s,pid),d in finals.items()
+            if d["gp_played_asof"] and (d["min_asof"]/d["gp_played_asof"])>=MIN_MPG]
+    mpg_cuts = (np.quantile(mpgs,1/3), np.quantile(mpgs,2/3)) if mpgs else (20,28)
+
+    # collect realised season rates per node per cohort (rotation players only)
+    # store (rate, attempts) pairs so means are ATTEMPT-WEIGHTED and kappa can
+    # separate between-player talent spread from within-player sampling noise.
+    league = defaultdict(list); cohort = defaultdict(lambda: defaultdict(list))
+    alloc_league = []; alloc_cohort = defaultdict(list)
+    for (s,pid),d in finals.items():
+        if not d["gp_played_asof"] or (d["min_asof"]/d["gp_played_asof"])<MIN_MPG:
+            continue
+        c = _cohort(pid, s, d, pos, firstyr, mpg_cuts)
+        for node in BETA_NODES:
+            mk, at = _beta_rate(d, node)
+            if at and at >= 20:
+                league[node].append((mk/at, at)); cohort[node][c].append((mk/at, at))
+        tot = (d["used_fga"] or 0)+(d["used_ft_trip"] or 0)+(d["used_tov"] or 0)
+        if tot >= 50:
+            v = [ (d["used_fga"] or 0)/tot, (d["used_ft_trip"] or 0)/tot, (d["used_tov"] or 0)/tot ]
+            alloc_league.append(v); alloc_cohort[c].append(v)
+
+    REF_ATT = 50.0  # fixed reference: prior shrinks a ~50-attempt player, barely
+                    # touches a 500-attempt star. kappa must NOT scale with a
+                    # node's own volume (that inverts the shrinkage), so it is
+                    # fixed at REF_ATT, not the pool's mean attempts.
+    def beta_mom(pairs, mean_att, slope):
+        # kappa from slope at a FIXED low reference attempt count (James-Stein):
+        # kappa = REF_ATT*(1-slope)/slope. slope~1 => small kappa (trust data);
+        # slope~0 => large kappa (shrink hard). Independent of node volume, so a
+        # high-attempt star self-dominates via his banked counts, not via kappa.
+        r = np.array([x[0] for x in pairs]); w = np.array([x[1] for x in pairs], float)
+        W = w.sum(); m = float((r*w).sum()/W)
+        if m<=0 or m>=1 or len(r)<5: return m, 200.0
+        sl = min(max(slope, 0.05), 0.98)
+        kappa = REF_ATT * (1.0 - sl) / sl
+        return m, float(min(max(kappa, 5.0), 500.0))
+
+    priors = {"mpg_cuts": mpg_cuts, "beta": {}, "beta_cohort": {}, "alloc": {},
+              "alloc_cohort": {}, "node_od": NODE_OD, "dirichlet": {}, "dirichlet_cohort": {}}
+    for node in BETA_NODES:
+        if league[node]:
+            sl = NODE_SLOPE.get(node, 0.6)
+            m_att = float(np.mean([a for (_, a) in league[node]]))
+            priors["beta"][node] = beta_mom(league[node], m_att, sl)
+            priors["beta_cohort"][node] = {
+                c: beta_mom(v, float(np.mean([a for (_, a) in v])), sl)
+                for c, v in cohort[node].items() if len(v) >= MIN_COHORT}
+    # keep legacy alloc mean for back-compat (unused by the Dirichlet path)
+    if alloc_league:
+        al = np.array(alloc_league); priors["alloc"]["league"] = al.mean(axis=0)*50.0
+
+    # --- Dirichlet composition nodes (allocation, shotmix) ---
+    # For each node collect realised season composition shares per player; fit a
+    # Dirichlet by matching the mean (direction) and the cross-sectional spread
+    # (concentration). Cohort-level where cells are dense, else league.
+    def _fit_dirichlet(share_rows):
+        # share_rows: list of share-vectors (each sums ~1). Returns alpha vector.
+        M = np.array(share_rows)
+        mean = M.mean(axis=0)
+        mean = np.clip(mean, 1e-4, None); mean = mean/mean.sum()
+        # concentration s: match mean component variance to Dirichlet var.
+        # var_k = mean_k(1-mean_k)/(s+1)  => s = median_k[ mean_k(1-mean_k)/var_k ] - 1
+        var = M.var(axis=0); var = np.clip(var, 1e-6, None)
+        s_est = np.median(mean*(1-mean)/var) - 1.0
+        s_est = float(min(max(s_est, 2.0), 500.0))
+        return mean * s_est
+
+    for node, cols in DIRICHLET_NODES.items():
+        league_rows = []; cohort_rows = defaultdict(list)
+        for (s, pid), d in finals.items():
+            if not d["gp_played_asof"] or (d["min_asof"]/d["gp_played_asof"])<MIN_MPG:
+                continue
+            vals = [max(d[c] or 0.0, 0.0) for c in cols]
+            tot = sum(vals)
+            if tot < DIR_MIN_TRIALS: continue
+            share = [v/tot for v in vals]
+            league_rows.append(share)
+            cohort_rows[_cohort(pid, s, d, pos, firstyr, mpg_cuts)].append(share)
+        if league_rows:
+            priors["dirichlet"][node] = _fit_dirichlet(league_rows)
+            priors["dirichlet_cohort"][node] = {
+                c: _fit_dirichlet(v) for c, v in cohort_rows.items() if len(v) >= MIN_COHORT}
+
+    # --- drift-inflation divisor per composition node (measured, walk-forward) ---
+    # The Dirichlet width is pure sampling noise on banked counts, which is too
+    # tight because a player's true share also DRIFTS over the remainder. Rather
+    # than a fragile variance decomposition, measure the divisor DIRECTLY by
+    # coverage matching: on TRAINING players, form the Dirichlet posterior (with
+    # a trial divisor), draw, and measure realised 80% coverage of the final
+    # share; pick the divisor whose coverage is closest to 0.80. Robust (just
+    # counting), walk-forward (training finals only), targets the actual defect.
+    priors["dir_inflation"] = {}
+    rng_fit = np.random.default_rng(19)
+    mids_by_key = defaultdict(list)
+    for (ss, snap, pid), d in counts.items():
+        mids_by_key[(ss, pid)].append((snap, d))
+    # build the training (mid, final) pairs once per node
+    for node, cols in DIRICHLET_NODES.items():
+        pairs = []
+        for (ss, pid), snaps in mids_by_key.items():
+            fd = finals.get((ss, pid))
+            if not fd or not fd["gp_played_asof"]: continue
+            if fd["min_asof"]/max(fd["gp_played_asof"],1) < MIN_MPG: continue
+            snaps.sort(key=lambda x: x[0])
+            cand = [dd for (sn, dd) in snaps if dd["gp_played_asof"] >= 25]
+            if not cand: continue
+            mid = cand[0]
+            bvals = [max(mid[cc] or 0.0, 0.0) for cc in cols]; bt = sum(bvals)
+            fvals = [max(fd[cc] or 0.0, 0.0) for cc in cols]; ft = sum(fvals)
+            if bt < 50 or ft < DIR_MIN_TRIALS: continue
+            c = _cohort(pid, ss, mid, pos, firstyr, mpg_cuts)
+            pairs.append((bvals, [v/ft for v in fvals], c))
+        if len(pairs) < 30:
+            priors["dir_inflation"][node] = 1.5; continue
+
+        def coverage_at(divisor):
+            hits = 0; tot = 0
+            for bvals, fshare, c in pairs:
+                alpha0 = priors["dirichlet_cohort"].get(node, {}).get(
+                    c, priors["dirichlet"].get(node))
+                if alpha0 is None: continue
+                alpha = np.asarray(alpha0, float) + np.asarray(bvals, float)/divisor
+                draws = rng_fit.dirichlet(alpha, size=120)
+                for j in range(len(cols)):
+                    lo, hi = np.quantile(draws[:, j], [0.1, 0.9])
+                    hits += 1 if lo <= fshare[j] <= hi else 0; tot += 1
+            return hits/tot if tot else 0.0
+
+        # grid search divisor in [1, 6]; pick coverage closest to 0.80
+        best_d, best_gap = 1.0, 9.9
+        for divisor in (1.0,1.5,2.0,2.5,3.0,4.0,5.0,6.0):
+            cov = coverage_at(divisor)
+            gap = abs(cov - 0.80)
+            if gap < best_gap: best_gap, best_d = gap, divisor
+        priors["dir_inflation"][node] = float(best_d)
+    return priors
+
+
+def beta_posterior(priors, node, cohort, banked_mk, banked_at):
+    m, kappa = priors["beta_cohort"].get(node, {}).get(cohort, priors["beta"].get(node, (0.4, 100.0)))
+    a0, b0 = m*kappa, (1-m)*kappa
+    inv_c = 1.0 / priors.get("node_od", {}).get(node, 1.0)  # underdispersed => more effective data
+    mk_eff = banked_mk * inv_c
+    at_eff = banked_at * inv_c
+    return a0 + mk_eff, b0 + (at_eff - mk_eff)
+
+
+def calib(priors, counts, finals, pos, firstyr, eval_seasons):
+    mpg_cuts = priors["mpg_cuts"]
+    rng = np.random.default_rng(3)
+    acc = defaultdict(lambda: {"pit": [], "cov": []})
+    # score at mid-season snapshots: posterior from banked-to-snapshot vs realised final rate
+    for (s, snap, pid), d in counts.items():
+        if s not in eval_seasons: continue
+        fd = finals.get((s, pid))
+        if not fd or not fd["gp_played_asof"] or (fd["min_asof"]/fd["gp_played_asof"])<MIN_MPG:
+            continue
+        c = _cohort(pid, s, d, pos, firstyr, mpg_cuts)
+        for node in BETA_NODES:
+            mk, at = _beta_rate(d, node)
+            fmk, fat = _beta_rate(fd, node)
+            if at < 10 or fat < 30: continue
+            a, b = beta_posterior(priors, node, c, mk, at)
+            draws = rng.beta(a, b, size=300)
+            realised = fmk/fat
+            acc[node]["pit"].append(float(np.mean(draws <= realised)))
+            lo, hi = np.quantile(draws, [0.1, 0.9])
+            acc[node]["cov"].append(1 if lo <= realised <= hi else 0)
+    return acc
+
+
+def dirichlet_posterior(priors, node, cohort, banked_counts, od=1.0):
+    alpha0 = priors["dirichlet_cohort"].get(node, {}).get(
+        cohort, priors["dirichlet"].get(node))
+    if alpha0 is None:
+        return None
+    inv_c = 1.0 / od
+    infl = priors.get("dir_inflation", {}).get(node, 1.0)  # drift widening
+    # divide banked contribution by the drift-inflation factor => wider posterior
+    return np.asarray(alpha0, float) + np.asarray(banked_counts, float) * inv_c / infl
+
+
+def calib_dirichlet(priors, counts, finals, pos, firstyr, eval_seasons):
+    """Per-component PIT + central-80 coverage of the Dirichlet posterior against
+    the realised final composition share. shotmix's 3PA-share leg lives here."""
+    mpg_cuts = priors["mpg_cuts"]
+    rng = np.random.default_rng(5)
+    acc = defaultdict(lambda: {"pit": [], "cov": []})
+    # a representative overdispersion for composition trials: reuse fg2-ish
+    od_alloc = priors.get("node_od", {}).get("fg2", 0.5)
+    for (s, snap, pid), d in counts.items():
+        if s not in eval_seasons: continue
+        fd = finals.get((s, pid))
+        if not fd or not fd["gp_played_asof"] or (fd["min_asof"]/fd["gp_played_asof"])<MIN_MPG:
+            continue
+        c = _cohort(pid, s, d, pos, firstyr, mpg_cuts)
+        for node, cols in DIRICHLET_NODES.items():
+            banked = [max(d[cc] or 0.0, 0.0) for cc in cols]
+            if sum(banked) < 20: continue
+            fvals = [max(fd[cc] or 0.0, 0.0) for cc in cols]
+            ftot = sum(fvals)
+            if ftot < DIR_MIN_TRIALS: continue
+            fshare = [v/ftot for v in fvals]
+            alpha = dirichlet_posterior(priors, node, c, banked, od=od_alloc)
+            if alpha is None: continue
+            draws = rng.dirichlet(alpha, size=300)
+            for j, comp in enumerate(cols):
+                lab = f"{node}:{comp}"
+                acc[lab]["pit"].append(float(np.mean(draws[:, j] <= fshare[j])))
+                lo, hi = np.quantile(draws[:, j], [0.1, 0.9])
+                acc[lab]["cov"].append(1 if lo <= fshare[j] <= hi else 0)
+    return acc
+
+
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    p = argparse.ArgumentParser()
+    p.add_argument("--db", default="data/awards.db")
+    p.add_argument("--fit-min", type=int, default=1996)
+    p.add_argument("--fit-max", type=int, default=2021)
+    p.add_argument("--eval-min", type=int, default=2022)
+    p.add_argument("--eval-max", type=int, default=2023)
+    args = p.parse_args(argv)
+    conn = connect(args.db)
+    fit_seasons = list(range(args.fit_min, args.fit_max+1))
+    eval_seasons = set(range(args.eval_min, args.eval_max+1))
+    all_seasons = fit_seasons + sorted(eval_seasons)
+    counts, finals, pos, firstyr = _load(conn, all_seasons)
+    conn.close()
+
+    fit_finals = {k:v for k,v in finals.items() if k[0] in set(fit_seasons)}
+    fit_counts = {k:v for k,v in counts.items() if k[0] in set(fit_seasons)}
+    priors = fit_priors(fit_counts, fit_finals, pos, firstyr)
+    log.info("fit priors on %d..%d; mpg terciles %.1f/%.1f", args.fit_min, args.fit_max,
+             priors["mpg_cuts"][0], priors["mpg_cuts"][1])
+    for node,(m,k) in priors["beta"].items():
+        nc = len(priors["beta_cohort"].get(node,{}))
+        log.info("  %-12s league mean=%.3f kappa=%.0f cohorts=%d", node, m, k, nc)
+    for node, infl in priors.get("dir_inflation", {}).items():
+        log.info("  dir_inflation %-8s = %.2f", node, infl)
+
+    acc = calib(priors, counts, finals, pos, firstyr, eval_seasons)
+    accd = calib_dirichlet(priors, counts, finals, pos, firstyr, eval_seasons)
+    print("\n"+"="*60)
+    print(f"rate-node calibration  fit={args.fit_min}-{args.fit_max} eval={args.eval_min}-{args.eval_max}")
+    print("well-calibrated: PIT ~0.50, cov80 ~0.80")
+    print("="*60)
+    print(f"{'node':>18} {'n':>6} {'PIT':>7} {'cov80':>7}")
+    for node in BETA_NODES:
+        a = acc[node]
+        if not a["pit"]: continue
+        print(f"{node:>18} {len(a['pit']):>6} {np.mean(a['pit']):>7.3f} {np.mean(a['cov']):>7.3f}")
+    print("-"*60 + "  (Dirichlet composition legs)")
+    for lab in sorted(accd):
+        a = accd[lab]
+        if not a["pit"]: continue
+        print(f"{lab:>18} {len(a['pit']):>6} {np.mean(a['pit']):>7.3f} {np.mean(a['cov']):>7.3f}")
+    print("="*60)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

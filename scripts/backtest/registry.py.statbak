@@ -1,0 +1,124 @@
+"""Registered award set for the single-pass backtest engine.
+
+Each AwardSpec binds one book to its producers, artefact and behavioural treatment,
+so the engine iterates this registry rather than dispatching on the award string.
+Adding an award is a new spec row plus its producer and artefacts, not surgery on the
+shared engine. The voter rows reproduce the pre-registry behaviour exactly; the sealed
++$460 gate is the proof of that reproduction. British English.
+
+Contract consumed by backtest_orchestrator_daily.prepare_award_daily / _award_core:
+
+  name        identity string for DB queries, model_eval labelling and logging.
+  seal_key    passed to config.assert_not_sealed(seal_key, season).
+  book_key    key into config.BOOK_WEIGHTS for the per-book budget.
+  samples_fn  (conn, name, season, feature_snaps) -> {snap: Samples}. Samples must
+              expose player_ids, vote_share_pred, sizing_weights and frac. For
+              pwin_kind='cloud' it must expose the eta-widened score cloud read by
+              backtest_orchestrator._cloud (attribute sim, falling back to cloud). For
+              pwin_kind='pool' it must expose a [n_draws, n_cand] pool, and for a
+              rank_floor of EXPLICIT_MASK a boolean tradeable_mask.
+  pricejoin_fn (conn, name, season) -> (feature_snaps, daily) with
+              daily = {day: (carried_snap, {player_id: yes_price})}. Called first;
+              feature_snaps feeds samples_fn.
+  vol_pkl     VOL_DEFAULT to call backtest_orchestrator.A_vol_model() verbatim, or a
+              path string loaded as ForwardVolModel(path).
+  pwin_kind   'cloud' (voter) or 'pool' (stat, wired at integration).
+  rank_floor  an int (ranked floor via sizer.rank_floor_mask, keyed by name) or the
+              EXPLICIT_MASK sentinel (mask taken from Samples.tradeable_mask).
+  fatigue_reweight / guard_top_k / jsfloor  the folded per-book behavioural treatment
+              that used to live in backtest_orchestrator's award-keyed dicts.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable
+import enum
+
+
+class _RankFloorMode(enum.Enum):
+    EXPLICIT_MASK = "explicit_mask"
+
+
+EXPLICIT_MASK = _RankFloorMode.EXPLICIT_MASK
+
+
+class _VolModel(enum.Enum):
+    DEFAULT = "default"
+
+
+VOL_DEFAULT = _VolModel.DEFAULT
+
+
+@dataclass(frozen=True)
+class AwardSpec:
+    name: str
+    seal_key: str
+    book_key: str
+    samples_fn: Callable
+    pricejoin_fn: Callable
+    vol_pkl: object
+    pwin_kind: str
+    rank_floor: object
+    fatigue_reweight: bool
+    guard_top_k: int
+    jsfloor: bool
+
+
+def voter_pricejoin(conn, name, season):
+    """Voter daily-grid price join, the real gated producer. Returns
+    (feature_snaps, daily) with daily = {day: (carried_snap, {player_id: yes_price})}."""
+    from scripts.backtest.engine.backtest_pricejoin_daily import load_daily_grid
+    return load_daily_grid(conn, name, season)
+
+
+def voter_samples(conn, name, season, feature_snaps):
+    """Voter joint-sample builder (pinned final model, eta-widened cloud on sim)."""
+    from scripts.backtest.engine import backtest_orchestrator as bo
+    return bo.A_build_samples(conn, name, season, feature_snaps)
+
+
+def load_vol_model(vol_pkl):
+    """VOL_DEFAULT reproduces backtest_orchestrator.A_vol_model() verbatim (bit-identical
+    for the voter gate, sidestepping the out/ versus models/ default-path ambiguity). A
+    path string is loaded as an explicit ForwardVolModel(path) for the stat arm."""
+    from scripts.backtest.engine import backtest_orchestrator as bo
+    if vol_pkl is VOL_DEFAULT:
+        return bo.A_vol_model()
+    from scripts.strategy.forward_estimates.forward_vol import ForwardVolModel
+    return ForwardVolModel(vol_pkl)
+
+
+_VOTER = (
+    AwardSpec(name="MVP", seal_key="MVP", book_key="MVP",
+              samples_fn=voter_samples, pricejoin_fn=voter_pricejoin,
+              vol_pkl=VOL_DEFAULT, pwin_kind="cloud", rank_floor=15,
+              fatigue_reweight=True, guard_top_k=1, jsfloor=True),
+    AwardSpec(name="DPOY", seal_key="DPOY", book_key="DPOY",
+              samples_fn=voter_samples, pricejoin_fn=voter_pricejoin,
+              vol_pkl=VOL_DEFAULT, pwin_kind="cloud", rank_floor=20,
+              fatigue_reweight=True, guard_top_k=1, jsfloor=True),
+    AwardSpec(name="ROTY", seal_key="ROTY", book_key="ROTY",
+              samples_fn=voter_samples, pricejoin_fn=voter_pricejoin,
+              vol_pkl=VOL_DEFAULT, pwin_kind="cloud", rank_floor=10,
+              fatigue_reweight=False, guard_top_k=1, jsfloor=True),
+)
+
+REGISTRY = {s.name: s for s in _VOTER}
+DEFAULT_AWARDS = tuple(REGISTRY)
+
+from scripts.backtest.stat_leader.stat_producers import stat_daily_grid, stat_samples
+
+for _b in ("PTS", "REB", "AST"):
+    REGISTRY[_b] = AwardSpec(
+        name=_b, seal_key=_b, book_key=_b,
+        samples_fn=stat_samples, pricejoin_fn=stat_daily_grid,
+        vol_pkl="models/forward_vol/forward_vol_stat.pkl",
+        pwin_kind="pool", rank_floor=EXPLICIT_MASK,
+        fatigue_reweight=False, guard_top_k=0, jsfloor=False)
+
+
+def get_spec(name):
+    try:
+        return REGISTRY[name]
+    except KeyError:
+        raise KeyError(
+            f"no AwardSpec registered for {name!r}; known books: {list(REGISTRY)}")

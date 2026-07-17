@@ -242,12 +242,14 @@ def _cloud(samples):
 
 
 def _composite(fe, cloud, cand_idx, leg_price, entry_cost, vol_model, frac, history, side,
-               central_pwin=None):
+               central_pwin=None, pw_pool=None):
     rng = np.random.default_rng((SEED, int(cand_idx), 0 if side == "yes" else 1, int(round(float(leg_price) * 1e6)), int(round(float(frac) * 1e6))))
+    _cloud_arg = None if pw_pool is not None else cloud.T
     edges = fe.composite_edge_draws(
-        cloud.T, cand_idx, current_price=leg_price, entry_cost=entry_cost,
+        _cloud_arg, cand_idx, current_price=leg_price, entry_cost=entry_cost,
         vol_model=vol_model, frac=frac, history=history, side=side,
-        n_draws=COMPOSITE_DRAWS, coupling_rho=COUPLING_RHO, central_pwin=central_pwin, rng=rng)
+        n_draws=COMPOSITE_DRAWS, coupling_rho=COUPLING_RHO, central_pwin=central_pwin,
+        pw_pool=pw_pool, rng=rng)
     read = fe.read_off(edges, q_low=CVAR_QLOW)
     psig = fe.price_dispersion(leg_price, vol_model, frac, history, n_draws=COMPOSITE_DRAWS, rng=rng)
     return read["risk_adjusted_edge"], read["expected_edge"], read["cvar_downside"], float(psig)

@@ -1,0 +1,275 @@
+"""Samples producer for the stat-leader books (pts / reb / ast), the analogue of
+backtest_samples.py. For each model snapshot it runs the Monte Carlo in ship
+config (AVAIL_HIER on, OWN_PRIOR_K=V.REF_MIN, measured minutes/games shrinks) over
+the UNION field (MC top-FIELD_N unioned with the market-listed resolved players,
+gp<1 market names dropped), fits the walk-forward Beta calibration on strictly
+earlier seasons, and emits per snapshot:
+
+  - player_ids        the full union field (the sizer scores the full field and
+                      masks the untradeable names, so P(lead) mass must be complete)
+  - vote_share_pred   the calibrated, renormalised P(lead), produced by the LOCKED
+                      calibrate_plead_walkforward point-path (bit-identical to what
+                      scorecard --beta yields; no re-implementation of the apply)
+  - sizing_weights    equal to vote_share_pred: the MC integrates forward uncertainty
+                      directly, so there is no separate flatter object as in the voter
+                      arm, they collapse
+  - pwin_pool         an [n_draws, n_cand] joint calibrated-P(lead) draw for the CVaR
+                      channel (column i is candidate i's [n_draws] pool; a row is one
+                      joint draw), drawn from the Beta coefficient covariance inv(H).
+                      The master consumes pwin_pool[:, i] where the voter arm uses
+                      forward_edge.per_draw_pwin(cloud, i)
+  - p_lead_raw        pre-Beta P(lead), for audit
+  - listed_ids        the market-listed resolved players present in this field (the
+                      candidate tradeable subset; final per-snapshot tradeability is
+                      decided by price presence in the price-join, not here)
+
+Seal. The eval season and every calibration-fit season are guarded by
+assert_not_sealed, so the producer REFUSES to run a sealed eval season. PRA holds
+out 2024 and 2025 (unlisted books default to both), so a real 2024 or 2025 run is
+impossible here until the master deliberately registers PTS/REB/AST in
+SEAL_REGISTRY. The dev season is 2023: calibration fits on <2023, applies to 2023.
+
+  uv run python3 -m scripts.backtest.stat_leader.stat_samples --stat reb --eval-season 2023
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import zlib
+from dataclasses import dataclass
+
+import numpy as np
+
+try:
+    from scripts.common.db import connect
+    from scripts.common import config as CFG
+    from scripts.modelling.stat_leader import mc as MC
+    from scripts.modelling.stat_leader import scorecard as SC
+    from scripts.modelling.stat_leader import calib as CB
+    from scripts.backtest.stat_leader import stat_pricejoin as PJ
+except ImportError:  # pragma: no cover
+    from db import connect  # type: ignore
+    import config as CFG  # type: ignore
+    import mc as MC  # type: ignore
+    import scorecard as SC  # type: ignore
+    import calib as CB  # type: ignore
+    import stat_pricejoin as PJ  # type: ignore
+
+log = logging.getLogger("stat_leader.samples")
+
+POOL_DRAWS = 4000
+MIN_FIT_SEASONS = 3   # matches calibrate_plead_walkforward(min_prior=3)
+
+
+@dataclass
+class StatSamples:
+    date: str
+    frac: float
+    player_ids: list
+    vote_share_pred: np.ndarray
+    sizing_weights: np.ndarray
+    pwin_pool: np.ndarray
+    p_lead_raw: np.ndarray
+    listed_ids: list
+
+
+def _pool_seed(eval_season, book, snap):
+    return zlib.crc32(f"pool|{eval_season}|{book}|{snap}".encode()) & 0xFFFFFFFF
+
+
+def _ship_config(B):
+    MC.MPG_K = B["mpg_k"]
+    MC.GAMES_K = B["games_k"]
+    MC.OWN_PRIOR_K = MC.V.REF_MIN
+
+
+def _reset_config():
+    MC.MPG_K = None
+    MC.GAMES_K = None
+    MC.OWN_PRIOR_K = None
+    MC.AVAIL_HIER = False
+
+
+def _seal_guard(book, seasons):
+    award = MC.STAT_AWARD[book]
+    for s in seasons:
+        CFG.assert_not_sealed(award, s)
+
+
+def _fit_rows(conn, book, eval_season, cal_min, fit_lookback, k, field_n):
+    """Walk-forward calibration fit rows over [max(cal_min, floor) .. eval-1], each
+    season scored on the default MC field (byte-identical to the scorecard path)."""
+    floor = SC.STAT_FLOOR[book]
+    seasons = [s for s in range(max(cal_min, floor), eval_season)]
+    rows = []
+    for s in seasons:
+        MC.AVAIL_HIER = True
+        try:
+            B = MC.load_all(conn, s, fit_lookback)
+        except Exception as e:  # pragma: no cover
+            log.warning("fit season %d skipped (%s)", s, e)
+            continue
+        _ship_config(B)
+        rows.extend(SC.collect(B, s, book, k, field_n))
+        log.info("fit season %d collected (rows so far %d)", s, len(rows))
+    return rows
+
+
+def _eval_snapshots(conn, book, eval_season, market_player_ids, fit_lookback, k, field_n):
+    """Score the eval season over the union field. Returns (meta_by_snap, drop_report)
+    where meta carries the field, frac and raw P(lead) per snapshot, and the drop
+    report tallies why requested market players were or were not admitted."""
+    MC.AVAIL_HIER = True
+    B = MC.load_all(conn, eval_season, fit_lookback)
+    _ship_config(B)
+
+    eff_real = MC.realised_eff(B["finals"], B["ftg"], eval_season, book)
+    leader = max(eff_real, key=eff_real.get) if eff_real else None
+    snaps = sorted(B["ctx"].keys())
+    listed = set(int(p) for p in market_player_ids)
+
+    meta = {}
+    drops = {"admitted_extra": 0, "in_topN_already": 0, "no_context": 0,
+             "no_counts": 0, "gp_lt_1": 0}
+    drop_names = {"no_context": set(), "no_counts": set(), "gp_lt_1": set()}
+    for si, snap in enumerate(snaps):
+        if leader is not None and leader not in B["ctx"].get(snap, {}):
+            continue
+        field, p_lead, _ = MC.snapshot_probs(
+            book, eval_season, snap, B["counts"], B["ctx"], B["vpriors"],
+            B["npriors"], B["pools"], B["tcut"], B["pos"], B["firstyr"],
+            k, field_n, extra_field=list(listed))
+        if not field:
+            continue
+        fr = si / max(1, len(snaps) - 1)
+        ctx_snap = B["ctx"].get(snap, {})
+        topn = set(MC._field_at(B["counts"], ctx_snap, eval_season, snap, book, field_n))
+        for pid in listed:
+            if pid not in ctx_snap:
+                drops["no_context"] += 1; drop_names["no_context"].add(pid); continue
+            d = B["counts"].get((eval_season, snap, pid))
+            if not d:
+                drops["no_counts"] += 1; drop_names["no_counts"].add(pid); continue
+            if (d.get("gp_played_asof") or 0.0) < 1:
+                drops["gp_lt_1"] += 1; drop_names["gp_lt_1"].add(pid); continue
+            drops["in_topN_already" if pid in topn else "admitted_extra"] += 1
+        meta[snap] = {"field": list(field), "frac": fr,
+                      "p_raw": np.asarray(p_lead, float),
+                      "listed": [pid for pid in field if pid in listed],
+                      "leader": leader}
+    return meta, {"tally": drops, "names": {k: sorted(v) for k, v in drop_names.items()}}
+
+
+def build_stat_samples(conn, book, eval_season, market_player_ids=(), cal_min=2008,
+                       fit_lookback=10, k=None, field_n=None, n_draws=POOL_DRAWS):
+    """Produce {snapshot_date: StatSamples} for one book and (non-sealed) eval season.
+    market_player_ids is the resolved season-level set from the price-join, unioned
+    into each snapshot's MC field. Read-only against the DB."""
+    k = MC.DEFAULT_K if k is None else k
+    field_n = MC.FIELD_N if field_n is None else field_n
+
+    floor = SC.STAT_FLOOR[book]
+    fit_seasons = [s for s in range(max(cal_min, floor), eval_season)]
+    _seal_guard(book, fit_seasons + [eval_season])
+    if len({s for s in fit_seasons}) < MIN_FIT_SEASONS:
+        raise RuntimeError(
+            f"only {len(fit_seasons)} fit seasons for {book} eval {eval_season}; "
+            f"calibration needs >= {MIN_FIT_SEASONS}. Lower --cal-min or raise eval.")
+
+    try:
+        fit_rows = _fit_rows(conn, book, eval_season, cal_min, fit_lookback, k, field_n)
+        meta, drop_report = _eval_snapshots(conn, book, eval_season, market_player_ids,
+                                            fit_lookback, k, field_n)
+    finally:
+        _reset_config()
+
+    eval_rows = []
+    for snap, m in meta.items():
+        leader = m["leader"]
+        for i, pid in enumerate(m["field"]):
+            eval_rows.append({"season": eval_season, "snap": snap, "pid": pid,
+                              "frac": m["frac"], "p_lead": float(m["p_raw"][i]),
+                              "y_lead": 1 if pid == leader else 0})
+
+    all_rows = fit_rows + eval_rows
+    cal = CB.calibrate_plead_walkforward(all_rows, min_prior=MIN_FIT_SEASONS)
+    cal_by = {(r["snap"], r["pid"]): r["p_lead"] for r in cal if r["season"] == eval_season}
+
+    prior = [r for r in all_rows if r["season"] < eval_season]
+    w, cov = CB.beta_fit_cov([r["p_lead"] for r in prior],
+                             [r["y_lead"] for r in prior],
+                             [r["frac"] for r in prior])
+
+    out = {}
+    for snap, m in meta.items():
+        field = m["field"]
+        vsp = np.array([cal_by[(snap, pid)] for pid in field], dtype=float)
+        fvec = np.full(len(field), m["frac"], dtype=float)
+        pool = CB.plead_pool(m["p_raw"], fvec, w, cov, n_draws=n_draws,
+                             seed=_pool_seed(eval_season, book, snap))
+        out[snap] = StatSamples(
+            date=snap, frac=m["frac"], player_ids=[int(p) for p in field],
+            vote_share_pred=vsp, sizing_weights=vsp.copy(), pwin_pool=pool,
+            p_lead_raw=m["p_raw"], listed_ids=[int(p) for p in m["listed"]])
+    out = dict(sorted(out.items()))
+    return out, {"beta_coef": w, "beta_cov": cov, "drops": drop_report,
+                 "n_fit_rows": len(fit_rows), "fit_seasons": fit_seasons}
+
+
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    p = argparse.ArgumentParser(description="Stat-leader samples producer (union field, walk-forward Beta, pwin pool).")
+    p.add_argument("--db", default="data/awards.db")
+    p.add_argument("--stat", default="reb", choices=["reb", "pts", "ast", "stl", "blk"])
+    p.add_argument("--eval-season", type=int, default=2023)
+    p.add_argument("--cal-min", type=int, default=2008)
+    p.add_argument("--fit-lookback", type=int, default=10)
+    p.add_argument("--k", type=int, default=MC.DEFAULT_K)
+    p.add_argument("--field-n", type=int, default=MC.FIELD_N)
+    p.add_argument("--n-draws", type=int, default=POOL_DRAWS)
+    p.add_argument("--extra-pids", default="",
+                   help="debug: comma player_ids to inject as the market set (exercise the union on the dry run)")
+    p.add_argument("--no-progress", action="store_true")
+    args = p.parse_args(argv)
+
+    conn = connect(args.db)
+    market_ids = ()
+    if args.extra_pids.strip():
+        market_ids = tuple(int(x) for x in args.extra_pids.split(","))
+        log.info("debug: injecting %d market pids into the union field", len(market_ids))
+    else:
+        pj = PJ.load_tradeable_stat(conn, args.stat, args.eval_season, snapshot_dates=[])
+        market_ids = tuple(pj.market_player_ids)
+        log.info("price-join resolved %d market players (routing=%s); %d unresolved",
+                 len(market_ids), pj.routing, len(pj.unresolved))
+        for mid, name, reason, slug in pj.unresolved[:20]:
+            log.info("  UNRESOLVED market=%s name=%r: %s [%s]", mid, name, reason, slug)
+
+    samples, report = build_stat_samples(
+        conn, args.stat, args.eval_season, market_player_ids=market_ids,
+        cal_min=args.cal_min, fit_lookback=args.fit_lookback, k=args.k,
+        field_n=args.field_n, n_draws=args.n_draws)
+    conn.close()
+
+    print("\n" + "=" * 70)
+    print(f"stat-leader samples  book={args.stat}  eval={args.eval_season}")
+    print(f"fit seasons: {report['fit_seasons']}  (rows={report['n_fit_rows']})")
+    print(f"union drops: {report['drops']['tally']}")
+    print(f"snapshots produced: {len(samples)}")
+    md = 0.0
+    for snap, s in list(samples.items())[:4] + list(samples.items())[-2:]:
+        pm = s.pwin_pool.mean(axis=0)
+        md = max(md, float(np.max(np.abs(pm - s.vote_share_pred))))
+        order = np.argsort(-s.vote_share_pred)[:4]
+        top = ", ".join(f"{s.player_ids[i]}:{s.vote_share_pred[i]:.3f}" for i in order)
+        print(f"  {snap} frac={s.frac:.2f} n={len(s.player_ids)} listed={len(s.listed_ids)} "
+              f"sumP={s.vote_share_pred.sum():.3f} | {top}")
+    print(f"pool-mean vs point max abs diff (sampled snaps): {md:.5f}")
+    print("=" * 70)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

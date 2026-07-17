@@ -16,7 +16,7 @@ import os
 import json
 import datetime as _dt
 
-DEFAULT_AWARDS = ("MVP", "DPOY", "ROTY")
+from scripts.backtest.registry import DEFAULT_AWARDS, get_spec
 
 
 def _daykey(day) -> str:
@@ -38,7 +38,8 @@ def _run_book_worker(job):
     from scripts.common.db import connect
     from scripts.backtest.engine.backtest_orchestrator_daily import (
         prepare_award_daily, step_award_day, finalize_award_daily)
-    ctx = prepare_award_daily(connect("data/awards.db"), aw, season, budget_per_book,
+    spec = get_spec(aw)
+    ctx = prepare_award_daily(connect("data/awards.db"), spec, season, budget_per_book,
                               use_stub=use_stub, verbose=verbose)
     entries = []
     for day in sorted({_daykey(d) for d in ctx.days}):
@@ -57,7 +58,7 @@ def _run_book_worker(job):
 
 
 def run_singlepass(season, awards=DEFAULT_AWARDS, budget_per_book=1000.0,
-                   use_stub=False, verbose=False, compound=False):
+                   use_stub=False, verbose=False, compound=False, rf=0.03):
     """Fan the independent books across processes and pool. Equity curve re-sorted to
     day-major for stable output. Budgets from ALLOC_BUDGETS_JSON when present."""
     import json as _json
@@ -75,7 +76,7 @@ def run_singlepass(season, awards=DEFAULT_AWARDS, budget_per_book=1000.0,
         from scripts.common import config
         _row = config.BOOK_WEIGHTS.get(season)
         if _row:
-            budgets = {aw: float(_row[aw]) for aw in awards}
+            budgets = {aw: float(_row[get_spec(aw).book_key]) for aw in awards}
             _shown = {aw: round(budgets[aw]) for aw in awards}
             print(f"[alloc] pinned BOOK_WEIGHTS[{season}] -> {_shown} (sum {sum(_shown.values())})")
         else:
@@ -114,7 +115,7 @@ def run_singlepass(season, awards=DEFAULT_AWARDS, budget_per_book=1000.0,
               "n_transactions_total": sum(r["book_summary"]["n_transactions"] for r in results.values()),
               "equity_curve": equity_log}
     from scripts.common.risk_metrics import report_pooled
-    _mtm, _mtm_dates, _mtm_eq = report_pooled([r["ledger"] for r in results.values()])
+    _mtm, _mtm_dates, _mtm_eq = report_pooled([r["ledger"] for r in results.values()], rf=rf)
     pooled["mtm"] = _mtm
     print("POOLED MTM:", _mtm)
     return results, pooled
@@ -129,6 +130,8 @@ def main():
     ap.add_argument("--out", default="out/singlepass")
     ap.add_argument("--stub-cost", action="store_true")
     ap.add_argument("--compound", action="store_true")
+    ap.add_argument("--rf", type=float, default=0.03,
+                    help="annual risk-free rate for Sharpe/Sortino (default 0.03)")
     args = ap.parse_args()
 
     compound = args.compound or os.environ.get("COMPOUND") == "1"
@@ -137,7 +140,7 @@ def main():
 
     results, pooled = run_singlepass(
         args.season, awards=tuple(args.awards), budget_per_book=args.budget,
-        use_stub=args.stub_cost, compound=compound)
+        use_stub=args.stub_cost, compound=compound, rf=args.rf)
 
     trade_rows, pos_rows, book_rows, model_eval = [], [], [], []
     print(f"config: region={os.environ.get('USE_REGION')=='1'} "
