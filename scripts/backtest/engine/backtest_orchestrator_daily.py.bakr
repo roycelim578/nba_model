@@ -333,12 +333,21 @@ def _award_core(ctx, day, budget, region_state, record):
         _conf = int(os.environ.get("REGION_CONFIRM", "2"))
         _hyst = float(os.environ.get("REGION_HYST", "1.0"))
         _mtf = float(os.environ.get("REGION_MIN_TRADE", "0.0"))
+        _band_mode = os.environ.get("REGION_BAND_MODE", bo.REGION_BAND_MODE)
+        _band_alpha = float(os.environ.get("BAND_ALPHA", bo.BAND_ALPHA))
+        _band_N = int(os.environ.get("BAND_N", bo.BAND_N))
+        _band_abs = float(os.environ.get("BAND_ABS_CAP", bo.BAND_ABS_CAP))
+        _band_move = os.environ.get("BAND_MOVE", bo.BAND_MOVE)
+        _band_fv = os.environ.get("BAND_FV", bo.BAND_FV)
         target_by_pid, pid_to_idx, _region_state = _region.region_target_by_pid(
             samples, pids, trad_idx, raw, radj_list, psig_list, kelly_targets,
             yes_mids, candidates, ledger, day, budget, ceiling, _scale_params,
             _region_state, snapshot_id=carried, confirm_snapshots=_conf,
             hysteresis_mult=_hyst, open_hurdle=bo.HURDLE, fill_form=bo.FILL_FORM,
-            fill_k=bo.FILL_K, min_fill=bo.MIN_FILL, min_trade_frac=_mtf)
+            fill_k=bo.FILL_K, min_fill=bo.MIN_FILL, min_trade_frac=_mtf,
+            vol_model=vol_model, hist_logit=hist_logit, frac=frac,
+            band_mode=_band_mode, band_alpha=_band_alpha, band_N=_band_N,
+            band_abs_cap=_band_abs, band_move=_band_move, band_fv=_band_fv)
     else:
         final_alloc, _fd = sizer_fill.size_positions(
             np.asarray(kelly_targets, float), np.asarray(radj_list, float),

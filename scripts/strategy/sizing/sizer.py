@@ -53,7 +53,8 @@ def rank_floor_mask(vote_share_pred, award):
     return mask
 
 
-def _make_objective(q, yes_price_fn, no_price_fn, portfolio, ncand, a_prev, turnover_frac):
+def _make_objective(q, yes_price_fn, no_price_fn, portfolio, ncand, a_prev, turnover_frac,
+                    carry_r=0.0, frac=0.0):
     """Negative expected log wealth over the ncand winner states weighted by q, minus a
     certain turnover toll for moving off a_prev. The toll is paid in every state, so it
     enters base wealth. turnover_frac[i] is the round-trip cost fraction on the dollar
@@ -76,7 +77,8 @@ def _make_objective(q, yes_price_fn, no_price_fn, portfolio, ncand, a_prev, turn
         turnover = float(np.sum(turnover_frac * np.abs(a - a_prev)))
         yes_leg = a > 0
         no_leg = a < 0
-        base = portfolio - outlay + shares[no_leg].sum() - turnover
+        carry = float(carry_r) * (1.0 - float(frac)) * float(outlay)
+        base = portfolio - outlay + shares[no_leg].sum() - turnover - carry
         W = np.full(ncand, base)
         W[no_leg] -= shares[no_leg]
         W[yes_leg] += shares[yes_leg]
@@ -92,7 +94,7 @@ def solve_award_v2(samples, cost_curves, portfolio_usd=1000.0, award_budget=None
                    kelly_fraction=1.0, n_restarts=6, seed=0, award=None,
                    tradeable_mask=None, central_weights="vote_share_pred",
                    a_prev=None, turnover_frac=None, turnover_default=0.0,
-                   guard_top_k=0):
+                   guard_top_k=0, carry_r=0.0, frac=0.0):
     """
     central_weights: "vote_share_pred" (default, calibrated) or "sizing_weights" (the old
       mean_of_softmax, for A/B).
@@ -131,7 +133,8 @@ def solve_award_v2(samples, cost_curves, portfolio_usd=1000.0, award_budget=None
 
     yes_fns = [cost_curves[i]["yes"] for i in range(ncand)]
     no_fns = [cost_curves[i]["no"] for i in range(ncand)]
-    neg_growth = _make_objective(q, yes_fns, no_fns, portfolio_usd, ncand, a_prev, turnover_frac)
+    neg_growth = _make_objective(q, yes_fns, no_fns, portfolio_usd, ncand, a_prev, turnover_frac,
+                                 carry_r=carry_r, frac=frac)
 
     def budget_con(a):
         return award_budget - np.abs(a).sum()

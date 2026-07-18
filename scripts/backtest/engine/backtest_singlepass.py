@@ -162,6 +162,8 @@ def main():
     bo._dump_csv(os.path.join(args.out, f"equity_curve_{args.season}.csv"), pooled["equity_curve"])
     with open(os.path.join(args.out, f"book_summary_{args.season}.json"), "w") as f:
         json.dump(book_rows, f, indent=2, default=str)
+    with open(os.path.join(args.out, f"pooled_{args.season}.json"), "w") as f:
+        json.dump(pooled, f, indent=2, default=str)
 
 
 if __name__ == "__main__":

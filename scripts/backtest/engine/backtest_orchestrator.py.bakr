@@ -58,6 +58,12 @@ CARRY_R = 0.0
 CONC_FORM = "hump"
 CONC_S_CAP_NO = 0.20
 CONC_S_CAP_YES = 0.45
+REGION_BAND_MODE = "curvature"
+BAND_ALPHA = 0.16
+BAND_N = 7
+BAND_ABS_CAP = 0.25
+BAND_MOVE = "center"
+BAND_FV = "off"
 
 
 def _logit(p):
