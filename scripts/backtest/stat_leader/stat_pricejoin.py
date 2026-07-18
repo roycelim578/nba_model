@@ -74,6 +74,7 @@ _RX_TITLE_OUTCOME = re.compile(r"win the .*(finals|conference|championship|title
 # will-<player>-lead-the-nba-in-<stat>; capture the player chunk before the verb.
 _SLUG_PLAYER_RX = re.compile(r"^will-(?P<name>.+?)-(?:leads?|to-lead|win)-", re.I)
 _DESC_PLAYER_RX = re.compile(r"^will\s+(?P<name>.+?)\s+(?:leads?|to\s+lead|win)\b", re.I)
+_SLUG_TRAIL_RX = re.compile(r"(?:leader|champion|winner|title)-(?P<name>[a-z][a-z0-9-]+)$", re.I)
 
 
 @dataclass
@@ -139,6 +140,10 @@ def _parse_player(slug, description=""):
     m = _SLUG_PLAYER_RX.match(slug or "")
     if m:
         return m.group("name").replace("-", " ").strip()
+    m = _SLUG_TRAIL_RX.search(slug or "")
+    if m:
+        nm = re.sub(r"-20\d\d(?:-\d\d)?$", "", m.group("name"))
+        return nm.replace("-", " ").strip()
     m = _DESC_PLAYER_RX.match(description or "")
     if m:
         return m.group("name").strip()

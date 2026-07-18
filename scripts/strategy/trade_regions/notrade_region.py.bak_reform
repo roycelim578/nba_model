@@ -225,9 +225,6 @@ def size_positions_region(
     _ASYM_DOWN = float(os.environ.get("ASYM_TRIM_DOWN", "1.0"))
     _ASYM_EPS = float(os.environ.get("ASYM_FV_EPS", "0.01"))
     min_trade_frac = max(float(min_trade_frac), 0.0)
-    _BANDMODE = os.environ.get("REGION_BAND_MODE", "curvature")  # _REFORM_BAND_MARKER
-    _BAND_VOL_MULT = float(os.environ.get("REGION_BAND_VOL_MULT", "0.05"))
-    _BAND_SIGMA_REF = float(os.environ.get("REGION_BAND_SIGMA_REF", "0.12"))
 
     out = np.zeros(n, dtype=float)
     diag = []
@@ -256,13 +253,8 @@ def size_positions_region(
         k = loggrowth_curvature_binary(f_mag, p_side, b)
         c = roundtrip_cost_fraction(lambda s, i=i: cost_frac_at_fns[i](s),
                                     max(abs(cur[i]), abs(scaled)))
-        if _BANDMODE == "vol":
-            _w_price = _BAND_VOL_MULT * (float(sig[i]) / max(_BAND_SIGMA_REF, 1e-9))
-            w_frac = hysteresis_mult * max(_w_price, float(c))
-            w_usd = w_frac * B
-        else:
-            w_frac = hysteresis_mult * band_halfwidth(c, k)
-            w_usd = w_frac * B
+        w_frac = hysteresis_mult * band_halfwidth(c, k)
+        w_usd = w_frac * B
         if _ASYM:
             _ki = keys[i]
             if snapshot_id is not None and reversal_state.get((_ki, "_fvsnap")) != snapshot_id:

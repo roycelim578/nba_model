@@ -2,28 +2,28 @@
 
 The stat-arm twin of book_weighting. Same shrinkage mechanism, different skill
 input: leaderboard-anchored BSS rather than the voter climatology BSS, because the
-stat thesis is beating the retail leaderboard anchor, so leaderboard-relative skill
-is the right within-arm proxy for alpha. The two arms are never compared on this
-number; it splits the stat sub-bankroll only, and the cross-arm split is handled
-separately. British English.
+stat thesis is beating the retail leaderboard anchor. The two arms are never
+compared on this number; it splits the stat sub-bankroll only.
 
-Mechanism per book for target season T:
-  1. Read the persisted per-season leaderboard-BSS (stat_bss_persist output).
-  2. Trailing-mean over the `trailing` seasons strictly before T.
-  3. Floor negatives to zero: a book below the leaderboard earns no capital.
-  4. Normalise to sum 1, then shrink halfway to 1/N.
-  5. Multiply by the stat sub-bankroll, round to whole dollars.
+Reads the per-season model and leaderboard Brier written by stat_bss_persist and
+pools them across the trailing window, so the skill denominator is a sum over many
+rows and never collapses (the per-season-ratio blow-up is thereby avoided):
 
-Walk-forward: a target season uses only seasons before it. Books absent from the
+  1. Trailing skill for target season T:
+         skill = 1 - sum_{s<T, last `trailing`} n_s * B_model_s
+                     / sum_{s<T, last `trailing`} n_s * B_leaderboard_s
+  2. Floor negatives to zero: a book at or below the leaderboard earns no capital.
+  3. Normalise to sum 1, then shrink halfway to 1/N.
+  4. Multiply by the stat sub-bankroll, round to whole dollars.
+
+Walk-forward: only seasons strictly before T are summed. Books absent from the
 artefact (STL, BLK until their scorecard lands) raise, so a premature eight-book
-call fails loudly rather than silently dropping a book.
+call fails loudly rather than silently dropping a book. British English.
 """
 from __future__ import annotations
 
 import argparse
 import json
-
-import numpy as np
 
 DEFAULT_JSON = "models/stat_leader/bss_by_season_pra.json"
 DEFAULT_AWARDS = ("PTS", "REB", "AST")
@@ -37,16 +37,20 @@ def _load(path):
 
 
 def book_skill_trailing(award, season, path=DEFAULT_JSON, trailing=TRAILING):
-    """Trailing-mean leaderboard-BSS for a book over the seasons before `season`."""
+    """Pooled trailing leaderboard-BSS for a book over the seasons before `season`."""
     d = _load(path)
     if award not in d:
         raise KeyError(f"{award} not in {path}; run stat_bss_persist for it first "
                        f"(STL/BLK need the STL/BLK-capable scorecard).")
-    pairs = sorted((int(s), v) for s, v in d[award].items() if v == v)
-    prior = [v for s, v in pairs if s < season]
+    recs = sorted((int(s), v) for s, v in d[award].items())
+    prior = [v for s, v in recs if s < season][-trailing:]
     if not prior:
         raise ValueError(f"no seasons before {season} for {award} in {path}")
-    return float(np.mean(prior[-trailing:]))
+    num = sum(v["n"] * v["brier_model"] for v in prior)
+    den = sum(v["n"] * v["brier_lead"] for v in prior)
+    if den <= 0:
+        return float("nan")
+    return 1.0 - num / den
 
 
 def compute_weights(season, awards=DEFAULT_AWARDS, path=DEFAULT_JSON,

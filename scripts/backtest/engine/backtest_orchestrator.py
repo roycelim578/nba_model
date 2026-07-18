@@ -92,7 +92,9 @@ def A_build_samples(conn, award, season, snaps):
     import pandas as pd
     bundle = pd.read_pickle(config.OOF_BUNDLE[award])
     bundle = bundle[bundle["season"] <= config.OOF_SEASON_CAP].copy()
-    fm = config.FINAL_MODEL[award]
+    import os as _os, json as _json
+    _ov = _os.environ.get("FINAL_MODEL_OVERRIDE_JSON")
+    fm = _json.loads(_ov)[award] if _ov else config.FINAL_MODEL[award]
     from scripts.common import samples_cache
     return samples_cache.load_or_build(
         award, season, snaps, fm, config.OOF_BUNDLE[award], config.OOF_SEASON_CAP,
