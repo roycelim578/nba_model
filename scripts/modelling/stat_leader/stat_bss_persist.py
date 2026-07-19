@@ -13,8 +13,9 @@ which is the scorecard's pooled BSS-vs-leaderboard restricted to the trailing
 window, and never divides by a near-zero denominator. Walk-forward: the weighter
 only sums seasons strictly before its target.
 
-Beta matches the shipping flag (on for REB and AST, off for PTS). PRA only; STL and
-BLK need the STL/BLK-capable scorecard. British English, no em dashes.
+Beta matches the shipping flag (on for REB and AST, off for PTS, STL and BLK).
+Five books; STL and BLK score raw through the STL/BLK-capable MC. British English,
+no em dashes.
 
   caffeinate -i uv run python3 -m scripts.modelling.stat_leader.stat_bss_persist \
       --eval-min 2008 --eval-max 2023 --workers 6 --no-progress \
@@ -46,7 +47,9 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger("stat_leader.bss_persist")
 
-BETA_BY_STAT = {"reb": True, "pts": False, "ast": True}
+STAT_FLOOR = {**STAT_FLOOR, "stl": STAT_FLOOR.get("stl", 2008), "blk": STAT_FLOOR.get("blk", 2008)}
+
+BETA_BY_STAT = {"reb": True, "pts": False, "ast": True, "stl": False, "blk": False}
 
 
 def _one_season(job):
@@ -110,7 +113,7 @@ def main(argv=None) -> int:
     p.add_argument("--out", default="models/stat_leader/bss_by_season_pra.json")
     args = p.parse_args(argv)
 
-    stats = ["reb", "pts", "ast"]
+    stats = ["reb", "pts", "ast", "stl", "blk"]
     try:
         from scripts.common.config import assert_not_sealed
     except ImportError:
