@@ -38,6 +38,8 @@ from __future__ import annotations
 import numpy as np
 import os
 
+_PORTFOLIO_SLACK = 0.0  # portfolio capital slack in [0,1], set by the shared-bankroll coordinator each day
+
 
 def kelly_star_binary(p, b):
     """Frictionless Kelly fraction for a binary bet, win prob p at net decimal odds b.
@@ -224,6 +226,10 @@ def size_positions_region(
     _ASYM_FLAT = float(os.environ.get("ASYM_TRIM_FLAT", "2.0"))
     _ASYM_DOWN = float(os.environ.get("ASYM_TRIM_DOWN", "1.0"))
     _ASYM_EPS = float(os.environ.get("ASYM_FV_EPS", "0.01"))
+    _SLACK_KAPPA = float(os.environ.get("SLACK_KAPPA", "2.0"))
+    _EDGE_NOISE = float(os.environ.get("EDGE_NOISE", "0.02"))
+    _PX_MIN = float(os.environ.get("PX_MIN", "0.05"))
+    _PX_MAX = float(os.environ.get("PX_MAX", "0.95"))
     min_trade_frac = max(float(min_trade_frac), 0.0)
     _BANDMODE = os.environ.get("REGION_BAND_MODE", "curvature")  # _REFORM_BAND_MARKER
     _BAND_VOL_MULT = float(os.environ.get("REGION_BAND_VOL_MULT", "0.05"))
@@ -237,11 +243,16 @@ def size_positions_region(
         scaled = 0.0 if floored else raw[i] * fill
 
         is_flat = abs(cur[i]) < 1e-9
-        refused_open = is_flat and (radj[i] <= open_hurdle)
-        if refused_open:
-            scaled = 0.0
+        if is_flat:
+            _open_scale = float(np.clip(radj[i] / open_hurdle, 0.0, 1.0)) if np.isfinite(radj[i]) else 1.0
+            scaled = scaled * _open_scale
+            refused_open = (_open_scale <= 0.0)
+        else:
+            refused_open = False
 
         pr = float(np.clip(px[i], 1e-4, 1.0 - 1e-4))
+        if (pr < _PX_MIN or pr > _PX_MAX) and abs(scaled) > abs(cur[i]):
+            scaled = cur[i]  # outside tradeable price band: hold, never open or add
         if abs(scaled) > 1e-9:
             side_sign = 1.0 if scaled > 0 else -1.0
         elif not is_flat:
@@ -281,6 +292,11 @@ def size_positions_region(
                 else:
                     w_usd = w_usd * _ASYM_DOWN
 
+        if _PORTFOLIO_SLACK > 0.0 and abs(cur[i]) > 1e-9 and abs(scaled) < abs(cur[i]):
+            _leg_px_side = pr if side_sign >= 0 else (1.0 - pr)
+            _edge_side = p_side - _leg_px_side
+            if _edge_side > -_EDGE_NOISE:
+                w_usd = w_usd * (1.0 + _SLACK_KAPPA * float(_PORTFOLIO_SLACK))
         if force_flat[i]:
             new = project_to_region(0.0, cur[i], 0.0)
         elif is_flat and not band_opens:

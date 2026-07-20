@@ -167,7 +167,7 @@ def _pwin_source(ctx, samples):
     raise ValueError(f"unknown pwin_kind {kind!r}")
 
 
-def _award_core(ctx, day, budget, region_state, record):
+def _award_core(ctx, day, budget, region_state, record, ref_budget=None):
     ScaleParams = ctx.ScaleParams
     award = ctx.award
     base_sw = ctx.base_sw
@@ -194,6 +194,7 @@ def _award_core(ctx, day, budget, region_state, record):
     warn_spread = ctx.warn_spread
     budget_asof = ctx.budget_asof
     _region_state = region_state
+    _ref_budget = ref_budget if ref_budget is not None else budget
     carried, yes_prices = ctx.daily[day]
     samples = samples_by_snap[carried]
     samples.vote_share_pred[:] = base_vsp[carried]
@@ -313,7 +314,7 @@ def _award_core(ctx, day, budget, region_state, record):
         side = "yes" if raw[i] > 0 else "no"
         leg_price = yes_mids[pid] if side == "yes" else 1.0 - yes_mids[pid]
         size_intended = abs(raw[i])
-        entry_cost = candidates[pid].cost_curve(day, side).cost_frac_at(size_intended)
+        entry_cost = 0.0  # radj is a size/cost-independent edge-quality gate; the solve carries the real convex cost
         hist = np.diff(np.asarray(hist_logit[pid], float)) if len(hist_logit[pid]) > 1 else np.zeros(1)
         _pw_pool = samples.pool[:, i] if ctx.pwin_kind == "pool" else None
         radj, eedge, cvar, psig = bo._composite(
@@ -335,7 +336,7 @@ def _award_core(ctx, day, budget, region_state, record):
         _mtf = float(os.environ.get("REGION_MIN_TRADE", "0.0"))
         target_by_pid, pid_to_idx, _region_state = _region.region_target_by_pid(
             samples, pids, trad_idx, raw, radj_list, psig_list, kelly_targets,
-            yes_mids, candidates, ledger, day, budget, ceiling, _scale_params,
+            yes_mids, candidates, ledger, day, _ref_budget, ceiling, _scale_params,
             _region_state, snapshot_id=carried, confirm_snapshots=_conf,
             hysteresis_mult=_hyst, open_hurdle=bo.HURDLE, fill_form=bo.FILL_FORM,
             fill_k=bo.FILL_K, min_fill=bo.MIN_FILL, min_trade_frac=_mtf)
@@ -345,7 +346,7 @@ def _award_core(ctx, day, budget, region_state, record):
             np.asarray(psig_list, float), hurdle=bo.HURDLE, min_fill=bo.MIN_FILL,
             fill_form=bo.FILL_FORM, fill_kwargs={"k": bo.FILL_K, "ceiling": ceiling})
         final_alloc = np.asarray(final_alloc, float)
-        sc = scale_allocation(final_alloc, budget, _scale_params,
+        sc = scale_allocation(final_alloc, _ref_budget, _scale_params,
                               price_dispersion=None, player_ids=[pids[i] for i in trad_idx])
         final_alloc = np.asarray(sc.scaled, float)
         pid_to_idx = {pids[i]: i for i in range(len(pids))}
@@ -362,6 +363,9 @@ def _award_core(ctx, day, budget, region_state, record):
             continue
         _pack.append((abs(float(_notion)), _ec[0], _ec[1]))
     out["edge_pack"] = _pack
+    out["psig_by_pid"] = {pids[trad_idx[j]]: float(psig_list[j]) for j in range(len(trad_idx))}
+    out["frac"] = float(frac)
+    out["radj_by_pid"] = {d["pid"]: float(d["radj"]) for d in diag_rows}
 
     if record:
         raw_by_pid = {pids[i]: float(raw[i]) for i in trad_idx}

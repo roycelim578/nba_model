@@ -53,6 +53,19 @@ SEAL_REGISTRY = {
 }
 _DEFAULT_SEAL = [2024, 2025]
 
+# Portfolio-level allocation (scripts/backtest/engine/backtest_portfolio.py). The shared
+# bankroll sizes every book against total equity-at-cost times a mean-one within-arm
+# skill tilt, then clamps with three structural caps and the joint capital constraint.
+# The caps only clip; re-pricing lives in the per-book Kelly objective and the tilt. See
+# scripts/strategy/allocation/portfolio_alloc.py.
+PORTFOLIO_PLAYER_CAP_BASE = 0.15    # single-book per-name ceiling as a fraction of equity
+PORTFOLIO_PLAYER_CAP_ALPHA = 0.5    # ceiling grows as base * n_books**alpha
+PORTFOLIO_AWARD_CAP_FRAC = 0.50     # per-book ceiling as a fraction of equity (rarely binds)
+PORTFOLIO_TYPE_CAP_C = 1.0          # breadth-reward constant in b/(b+c) for the type partition
+PORTFOLIO_TYPE_VALIDATED = {"voter": 3, "stat": 3}  # validated book count per arm
+PORTFOLIO_TILT_SHRINK = 0.5         # fraction of raw skill kept before normalising the tilt
+PORTFOLIO_BSS_PATH = "models/stat_leader/bss_by_season_pra.json"
+
 
 def assert_not_sealed(award, season):
     """Raise if `season` is a sealed held-out season for `award`. Protects the one-shot
